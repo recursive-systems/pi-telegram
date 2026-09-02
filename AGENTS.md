@@ -18,7 +18,8 @@ see its AGENTS.md for the one-poller-per-token handoff protocol (`/stop`).
 
 ## Extension notes (as of vendoring, pi 0.84.4)
 
-- `index.ts` is the whole extension (~1,130 lines, zero runtime deps)
+- `index.ts` + `markdown-to-telegram.ts` (zero runtime deps except
+  `markdown-it`, which pi installs automatically via `dependencies`)
 - Imports still use the `@mariozechner/*` peer scope — they resolve today
   (pi ships compat modules + this dir has its own `node_modules`). If a pi
   upgrade breaks them, retarget to `@earendil-works/pi-ai`,
@@ -28,6 +29,8 @@ see its AGENTS.md for the one-poller-per-token handoff protocol (`/stop`).
 
 ## Features worth porting from the sibling bridge (`../pi-telegram/src`)
 
-- `markdown-to-telegram.ts` — markdown → Telegram-safe HTML replies
+- ~~`markdown-to-telegram.ts` — markdown → Telegram-safe HTML replies~~
+  (ported 2026-09-02; wired into previews, final messages, and
+  `sendTextReply` with plain-text fallback on API rejection)
 - `/model` command — `ctx.model` is exposed by the ExtensionAPI
 - Multi-ID allowlist instead of single paired user

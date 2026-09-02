@@ -4,7 +4,13 @@
   "private": false,
   "description": "Telegram DM bridge extension for pi",
   "type": "module",
-  "keywords": ["pi-package", "pi", "telegram", "bot", "extension"],
+  "keywords": [
+    "pi-package",
+    "pi",
+    "telegram",
+    "bot",
+    "extension"
+  ],
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -15,12 +21,20 @@
     "url": "https://github.com/recursive-systems/pi-telegram/issues"
   },
   "pi": {
-    "extensions": ["./index.ts"]
+    "extensions": [
+      "./index.ts"
+    ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
     "@sinclair/typebox": "*"
+  },
+  "dependencies": {
+    "markdown-it": "^15.0.1"
+  },
+  "devDependencies": {
+    "@types/markdown-it": "^14.2.0"
   }
 }

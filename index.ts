@@ -10,6 +10,8 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
+import { markdownToTelegramHtml } from "./markdown-to-telegram.ts";
+
 interface TelegramConfig {
 	botToken?: string;
 	botUsername?: string;
@@ -501,13 +503,23 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
-			state.messageId = sent.message_id;
+			const html = markdownToTelegramHtml(truncated);
+			try {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML" });
+				state.messageId = sent.message_id;
+			} catch {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+				state.messageId = sent.message_id;
+			}
 			state.mode = "message";
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		try {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: markdownToTelegramHtml(truncated), parse_mode: "HTML" });
+		} catch {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		}
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -529,7 +541,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await sendFormattedText(chatId, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
@@ -537,15 +549,22 @@ export default function (pi: ExtensionAPI) {
 		return state.messageId !== undefined;
 	}
 
+	/** Send `text` preferring formatted HTML, falling back to plain text on rejection. */
+	async function sendFormattedText(chatId: number, text: string): Promise<number | undefined> {
+		try {
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: markdownToTelegramHtml(text), parse_mode: "HTML" });
+			return sent.message_id;
+		} catch {
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text });
+			return sent.message_id;
+		}
+	}
+
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-			});
-			lastMessageId = sent.message_id;
+			lastMessageId = await sendFormattedText(chatId, chunk);
 		}
 		return lastMessageId;
 	}
