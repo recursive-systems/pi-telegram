@@ -1,6 +1,9 @@
+import { execFile } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
+import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -157,6 +160,35 @@ const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
 const PREVIEW_THROTTLE_MS = 750;
+const EXTENSION_DIR = fileURLToPath(new URL(".", import.meta.url));
+
+const execFileAsync = promisify(execFile);
+let cachedExtensionVersion: string | null = null;
+
+/**
+ * Best-effort git version of the running extension code, cached for the
+ * session. Reports the short SHA plus " (dirty)" when the working tree
+ * has uncommitted changes, so dogfooding sessions can verify exactly
+ * what they are running.
+ */
+async function getExtensionVersion(): Promise<string> {
+	if (cachedExtensionVersion !== null) return cachedExtensionVersion;
+	try {
+		const { stdout: shaOut } = await execFileAsync("git", ["rev-parse", "--short", "HEAD"], { cwd: EXTENSION_DIR });
+		const sha = shaOut.trim();
+		let dirty = false;
+		try {
+			const { stdout: statusOut } = await execFileAsync("git", ["status", "--porcelain"], { cwd: EXTENSION_DIR });
+			dirty = statusOut.trim().length > 0;
+		} catch {
+			// dirty check is best-effort
+		}
+		cachedExtensionVersion = `${sha}${dirty ? " (dirty)" : ""}`;
+	} catch {
+		cachedExtensionVersion = `unknown (no git metadata in ${EXTENSION_DIR})`;
+	}
+	return cachedExtensionVersion;
+}
 const TELEGRAM_DRAFT_ID_MAX = 2_147_483_647;
 const TELEGRAM_MEDIA_GROUP_DEBOUNCE_MS = 1200;
 
@@ -755,6 +787,12 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (lower === "/version") {
+			const version = await getExtensionVersion();
+			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `pi-telegram extension @ ${version}`);
+			return;
+		}
+
 		if (lower === "/compact") {
 			if (!ctx.isIdle()) {
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Cannot compact while pi is busy. Send \"stop\" first.");
@@ -989,6 +1027,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Show Telegram bridge status",
 		handler: async (_args, ctx) => {
 			const status = [
+				`version: ${await getExtensionVersion()}`,
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
