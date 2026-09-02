@@ -1,9 +1,10 @@
 # pi-telegram-extension
 
-Pristine clone of [badlogic/pi-telegram](https://github.com/badlogic/pi-telegram)
-(MIT) — a Telegram DM bridge implemented as a **pi TUI extension**. Installed
-into pi user settings as a local-path package (`pi list` shows it), so edits
-here take effect in any new pi session — no reinstall needed.
+Our fork of [badlogic/pi-telegram](https://github.com/badlogic/pi-telegram)
+(MIT) — a Telegram DM bridge implemented as a **pi TUI extension**. Lives at
+`recursive-systems/pi-telegram` (public, MIT). Installed into pi user
+settings as a local-path package (`pi list` shows it), so edits here take
+effect in any new pi session — no reinstall needed.
 
 **This is the canonical place to extend Telegram support.** The sibling
 `../pi-telegram/` repo is a headless always-on bridge with the same bot token;
