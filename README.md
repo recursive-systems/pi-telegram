@@ -77,7 +77,9 @@ new agent run supersedes it and must settle in its own right. Compaction alone
 never creates settlement debt.
 `blocker` reports the current admission gate, not a diagnosis of the host.
 Preparation age covers the current uninterrupted batch; queued age starts after
-attachment preparation. Ages use the process wall clock.
+attachment preparation. After an explicit handoff, queued and held ages start
+once at restoration in the new instance, **not original arrival**. Diagnostic
+timestamps are not checkpointed. Ages use the process wall clock.
 
 `instance` and `loadedAt` identify this extension factory invocation. The lazy
 cached **checkout version is not proof of loaded code**. The UUID is factory

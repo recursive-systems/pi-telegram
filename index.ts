@@ -1235,6 +1235,15 @@ export default function (pi: ExtensionAPI) {
 		return false;
 	}
 
+	// Abandoning before quiescing must replace wakes consumed under reloadPending.
+	// Use the normal deferred finalization/admission gates; never reconnect or
+	// release existing stop/disconnected/recovery holds here.
+	function releaseUnstartedReload(ctx: ExtensionContext): void {
+		reloadPending = false;
+		reloadRunning = false;
+		drainTelegramQueue(ctx);
+	}
+
 	pi.registerCommand("telegram-reload", {
 		description: "Explicit runtime reload with a one-shot Telegram queue handoff (does not upgrade source)",
 		handler: async (_args, ctx) => {
@@ -1243,7 +1252,7 @@ export default function (pi: ExtensionAPI) {
 			reloadRunning = true;
 			let stopped = false;
 			try {
-				if (refuseReload(ctx)) { reloadPending = false; reloadRunning = false; return; }
+				if (refuseReload(ctx)) { releaseUnstartedReload(ctx); return; }
 				await ctx.waitForIdle();
 				if (finalizingReply) await new Promise<void>(resolve => replyWaiters.push(resolve));
 				if (closed) return;
@@ -1259,8 +1268,7 @@ export default function (pi: ExtensionAPI) {
 				const persisted = await stat(sessionFile).then(info => info.isFile(), () => false);
 				if (closed) return;
 				if (!persisted) {
-					reloadPending = false;
-					reloadRunning = false;
+					releaseUnstartedReload(ctx);
 					ctx.ui.notify("Telegram reload refused: session file is not persisted yet. Let Pi save an assistant response before retrying; queued work remains in this instance.", "error");
 					return;
 				}
@@ -1295,8 +1303,11 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				if (closed) return;
 				checkpoint = undefined;
-				reloadRunning = false;
-				reloadPending = false;
+				if (!stopped) releaseUnstartedReload(ctx);
+				else {
+					reloadRunning = false;
+					reloadPending = false;
+				}
 				ctx.ui.notify(stopped
 					? "Telegram reload stopped before teardown. Queue/evidence retained locally; polling stopped. Resolve the problem and explicitly retry /telegram-reload or /telegram-connect."
 					: "Telegram reload refused before teardown. Work retained; wait for safe idle and retry.", "error");
@@ -1475,9 +1486,13 @@ export default function (pi: ExtensionAPI) {
 			await mkdir(TEMP_DIR, { recursive: true });
 			if (saved.configDigest !== configDigest(config) || saved.cursor !== config.lastUpdateId) throw new Error("config mismatch");
 			queuedTelegramTurns = structuredClone(saved.turns);
+			// Diagnostic clocks restart in this instance, not at original arrival.
+			const restoredAt = Date.now();
+			for (const turn of queuedTelegramTurns) queuedAt.set(turn, restoredAt);
 			restoredDisconnected = !saved.connected;
 			preserveQueuedTurnsAsHistory = saved.held;
 			stopGeneration = saved.stopGeneration;
+			transition("queue-restored");
 			if (saved.connected) {
 				if (!config.botToken) throw new Error("missing config");
 				// A successful real API round trip, not creation of a polling promise. This

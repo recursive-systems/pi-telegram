@@ -288,3 +288,112 @@ test('stop arriving during an album download keeps that prepared turn held throu
   assert.match(text(h.sent[0]), /held album/); assert.match(text(h.sent[0]), /Attachments:/);
   assert.equal(h.maxPolls, 1);
 });
+
+// Only the harness-owned fake session stat is delayed. Rebind named built-in
+// exports both when mocking and restoring; never leave a mock for the next case.
+for (const result of ['not-file', 'missing', 'throw-isFile']) {
+  for (const hold of ['none', 'stop']) {
+    test(`pre-quiesce ${result} refusal restores a consumed drain (${hold})`, async t => {
+      const h = await harness(t);
+      const fs = (await import('node:fs/promises')).default;
+      const { syncBuiltinESMExports } = await import('node:module');
+      const original = fs.stat, persistence = deferred(), download = deferred();
+      let checking = false, downloading = false;
+      const mock = t.mock.method(fs, 'stat', async (path, ...args) => {
+        if (path !== h.ctx.sessionManager.getSessionFile()) return original(path, ...args);
+        checking = true;
+        await persistence.promise;
+        if (result === 'missing') throw new Error('fake missing session');
+        return { isFile() { if (result === 'throw-isFile') throw new Error('fake stat error'); return false; } };
+      });
+      syncBuiltinESMExports();
+      try {
+        h.networkGate = async method => { if (method === 'download') { downloading = true; await download.promise; } };
+        await h.receive('first', { document: { file_id: 'fake-doc', file_name: 'fake.txt' } });
+        await until(() => downloading);
+        await h.receive('second');
+        const reload = h.command('telegram-reload');
+        await until(() => checking);
+        if (hold === 'stop') await h.receive('stop');
+        download.resolve();
+        for (let i = 0; i < 100; i++) {
+          const d = await h.diagnostic();
+          if (d.queued === 2 && !d.preparing && !d.drainScheduled) break;
+          await ticks();
+        }
+        const blocked = await h.diagnostic();
+        assert.equal(blocked.queued, 2); assert.equal(blocked.preparing, false);
+        assert.equal(blocked.drainScheduled, false); assert.equal(blocked.reloadPending, true);
+        assert.equal(h.sent.length, 0);
+        const polls = h.network.filter(n => n.method === 'getUpdates').length;
+        persistence.resolve(); await reload; await ticks();
+        assert.equal(h.generation, 1); assert.equal(snapshots(h).length, 0);
+        assert.deepEqual(h.lifecycle, []);
+        assert.equal(h.network.filter(n => n.method === 'getUpdates').length, polls);
+        assert.equal(h.polling, true);
+        assert.equal(h.sent.length, hold === 'none' ? 1 : 0, 'refusal must restore normal guarded admission without another event');
+        if (hold === 'none') {
+          assert.match(text(h.sent[0]), /first/);
+          await h.start(); await h.end(); await h.settle(); await ticks();
+          assert.equal(h.sent.length, 2); assert.match(text(h.sent[1]), /second/);
+          await h.start(); await h.end(); await h.settle(); await ticks();
+          assert.equal(h.sent.length, 2);
+        } else {
+          await h.settle(); await ticks(); assert.equal(h.sent.length, 0);
+        }
+        assert.equal(h.errors.length, 0);
+      } finally {
+        persistence.resolve(); download.resolve(); mock.mock.restore(); syncBuiltinESMExports();
+      }
+    });
+  }
+}
+
+for (const mode of ['held', 'disconnected', 'held-disconnected']) {
+  test(`restored ${mode} diagnostic ages advance without lifecycle wakes`, async t => {
+    const h = await harness(t);
+    let now = Date.now(); t.mock.method(Date, 'now', () => now);
+    await h.start('local'); await h.receive('queued');
+    const held = mode.includes('held');
+    if (held) await h.receive('stop');
+    if (mode.includes('disconnected')) await h.command('telegram-disconnect');
+    now += 120_000; // pre-restoration age must not be invented in the new instance
+    const reload = h.command('telegram-reload'); await h.end(); await h.settle(); await reload;
+    assert.equal(h.generation, 2);
+    const before = await h.diagnostic();
+    assert.equal(before.queued, 1); assert.equal(before.held, held);
+    assert.equal(before.agesMs.queued, 0);
+    const requests = h.network.length, restoredAt = now;
+    for (const elapsed of [60_000, 90_000]) {
+      now += elapsed;
+      const after = await h.diagnostic();
+      assert.equal(after.agesMs.queued, now - restoredAt, 'queue age is restoration-relative');
+      if (held) assert.equal(after.agesMs.held, after.agesMs.queued);
+      assert.deepEqual(after.lifecycle.map(e => e.event), before.lifecycle.map(e => e.event));
+      assert.equal(h.sent.length, 0); assert.equal(h.network.length, requests);
+    }
+  });
+}
+
+test('pre-quiesce missing-session catch preserves a restored disconnected queue', async t => {
+  const h = await harness(t); await h.start('local'); await h.receive('retained');
+  await h.command('telegram-disconnect');
+  const reload = h.command('telegram-reload'); await h.end(); await h.settle(); await reload;
+  const requests = h.network.length;
+  h.sessionFile = undefined;
+  await h.command('telegram-reload'); await ticks(); await h.settle(); await ticks();
+  assert.equal(h.generation, 2); assert.equal(snapshots(h).length, 1);
+  assert.equal(h.sent.length, 0); assert.equal(h.network.length, requests);
+  assert.equal((await h.diagnostic()).restoredDisconnected, true);
+});
+
+test('recovery-required early return cannot release restored work or restart polling', async t => {
+  const h = await harness(t); await h.start('local'); await h.receive('retained');
+  h.reloadHook = async phase => { if (phase === 'after') h.networkGate = async method => { if (method === 'getUpdates') throw new Error('fake offline'); }; };
+  const reload = h.command('telegram-reload'); await h.end(); await h.settle(); await reload;
+  const requests = h.network.length;
+  await h.command('telegram-reload'); await h.settle(); await ticks();
+  assert.equal((await h.diagnostic()).recoveryRequired, true);
+  assert.equal(h.generation, 2); assert.equal(snapshots(h).length, 1);
+  assert.equal(h.sent.length, 0); assert.equal(h.network.length, requests);
+});
