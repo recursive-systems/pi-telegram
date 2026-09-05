@@ -29,13 +29,8 @@
     "@mariozechner/pi-agent-core": "*",
     "@mariozechner/pi-ai": "*",
     "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*"
-  },
-  "dependencies": {
-    "markdown-it": "^15.0.1"
-  },
-  "devDependencies": {
-    "@types/markdown-it": "^14.2.0"
+    "@sinclair/typebox": "*",
+    "@earendil-works/pi-tui": "^0.85.0"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test test/*.test.mjs"

@@ -168,8 +168,12 @@ MIT
 
 ## Runtime and tests
 
-Requires Pi **0.84.3 or newer** (`session_compact_failed`, `agent_settled`, and session-level idle semantics;
-verified against 0.85.0). Telegram work waits for Pi to settle, including retries
+Requires Pi **0.85.x** (verified against 0.85.0). Markdown uses `Marked` and its
+public token types from the host-supplied `@earendil-works/pi-tui` peer
+(`^0.85.0`, currently supplying Marked 18.0.5), not a standalone parser dependency.
+The Telegram renderer remains owned here. Older Pi releases are not supported;
+other existing peer scopes are unchanged. Queue behavior relies on
+`session_compact_failed`, `agent_settled`, and session-level idle semantics. Telegram work waits for Pi to settle, including retries
 and automatic compaction. Manual compaction success/failure also wakes the queue,
 after a deferred idle/pending check. Albums reserve FIFO at first arrival, before
 debounce and downloads. Each submitted prompt carries a unique turn marker;
@@ -179,12 +183,33 @@ messages as ordered history for the next Telegram message.
 Run deterministic offline regression tests with Node **22.22+**:
 
 ```bash
-npm ci --ignore-scripts
 npm test
 ```
 
-Tests use a temporary HOME, fake Pi lifecycle, mocked fetch, and fake timers.
-No bot, credentials, or model is used.
+Outside Pi's extension loader, Node must resolve the host-supplied peers. For an
+isolated checkout, use a **private** `node_modules` directory with package symlinks
+to an existing Pi host's TUI and existing baseline peer dependencies. Do not run
+an install against a `node_modules` symlink to another checkout. This avoids
+installing a second Pi runtime just to test. The lockfile retains the existing
+legacy peer dependency tree; npm's normal peer auto-install policy is unchanged.
+
+Formatter tests use the real public Pi-supplied Marked export. Queue tests use a
+temporary HOME, fake Pi lifecycle, mocked fetch, and fake timers. No bot,
+credentials, or model is used.
+
+The formatter was compared offline with the original markdown-it renderer on
+40 expected-output fixtures. This is not a perfect CommonMark parity claim:
+- Nested quotes are flattened because Telegram disallows nested blockquotes.
+- Unsupported/malformed link destinations retain escaped Markdown source.
+- Marked's raw HTML blocks remain entirely literal (including Markdown inside).
+- Nonempty code blocks normalize a trailing newline, including unclosed fences.
+- Numeric references and `amp`, `lt`, `gt`, `quot`, `apos` (plus the valid
+  uppercase `AMP`, `LT`, `GT`, `QUOT` aliases) decode once outside code/raw HTML.
+  Other named entities (e.g. `&copy;`) remain literal text instead
+  of requiring an additional HTML entity-table dependency or emitting entities
+  Telegram rejects. Use Unicode or numeric references for those characters.
+- Marked GFM handles tables/tasks; bare URLs and single-tilde strike remain literal.
+  Incomplete delimiters retain their source; unclosed fences still render as code.
 
 Pi's extension `sendUserMessage` API returns void, **not an async admission
 acknowledgement**. Preflight failures (e.g. missing model/auth), intercepted
