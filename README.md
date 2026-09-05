@@ -137,3 +137,41 @@ It tries Telegram draft streaming first with `sendMessageDraft`. If that is not 
 ## License
 
 MIT
+
+## Runtime and tests
+
+Requires Pi **0.84.3 or newer** (`session_compact_failed`, `agent_settled`, and session-level idle semantics;
+verified against 0.85.0). Telegram work waits for Pi to settle, including retries
+and automatic compaction. Manual compaction success/failure also wakes the queue,
+after a deferred idle/pending check. Albums reserve FIFO at first arrival, before
+debounce and downloads. Each submitted prompt carries a unique turn marker;
+unrelated local/jobs prompts never claim Telegram replies. `stop` holds queued
+messages as ordered history for the next Telegram message.
+
+Run deterministic offline regression tests with Node **22.22+**:
+
+```bash
+npm ci --ignore-scripts
+npm test
+```
+
+Tests use a temporary HOME, fake Pi lifecycle, mocked fetch, and fake timers.
+No bot, credentials, or model is used.
+
+Pi's extension `sendUserMessage` API returns void, **not an async admission
+acknowledgement**. Preflight failures (e.g. missing model/auth), intercepted
+inputs, or transformations removing the turn marker leave the submission waiting
+and **block all subsequent Telegram messages** rather than risk a duplicate
+resend. Transformations preserving the marker remain compatible. Pi reports
+preflight errors locally. A suspended `before_agent_start`, including a foreign
+prompt, also holds dispatch until `agent_start`; there is no preflight-failure
+hook to safely release that guard. Work before this extension receives its hooks
+is not observable; this is not a host-wide prompt admission lock.
+
+Recovery: first preserve the affected messages/attachments in Telegram, resolve
+the local preflight/interception problem, then restart/reload this extension's Pi
+session and resend the desired messages from Telegram in order. Disconnect and
+reconnect alone do not reset the reservation, nor does sending another message.
+Queued work is session-local and is not restored after teardown; there is no
+persistence or speculative retry. Check whether an unacknowledged prompt actually
+ran before resending it.
