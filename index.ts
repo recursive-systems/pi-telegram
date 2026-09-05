@@ -411,12 +411,15 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		const hostIdle = ctx.isIdle(), hostPending = ctx.hasPendingMessages();
 		const state = phases();
-		const blocker = closed ? "closed" : state.preflight ? "preflight" : state.held ? "held" :
+		const blocker = closed ? "closed" : recoveryRequired ? "recovery-required" : reloadPending ? "reload-pending" :
+			restoredDisconnected ? "restored-disconnected" : failedPreparations.length || failedIngress.length ? "failed-ingress-or-preparation" : state.preflight ? "preflight" : state.held ? "held" :
 			state.submitted ? "submitted" : state.active ? "active-awaiting-settlement" :
 			state.finalizing ? "finalizing" : !hostIdle ? "host-busy" : hostPending ? "host-pending" :
 			queuedTelegramTurns.length ? "awaiting-drain" : state.preparing ? "preparing" : "none";
 		return { instance, loadedAt, closed, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
 			queued: queuedTelegramTurns.length, ...state, preparationCount,
+			reloadPending, recoveryRequired, restoredDisconnected, uncertainReply: !!uncertainReply,
+			failedPreparations: failedPreparations.length, failedIngress: failedIngress.length,
 			routingTelegram, awaitingTelegramStart, settlementOwed, finalizationStage,
 			previewFlushing: !!previewState?.flushing, previewScheduled: !!previewState?.flushTimer,
 			drainScheduled: !!drainTimer, compactionWakeScheduled: !!compactionWakeTimer,

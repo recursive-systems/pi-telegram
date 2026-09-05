@@ -60,7 +60,11 @@ export async function harness(t, options = {}) {
       },
     };
     generation++;
-    if (omitExtension) return;
+    if (omitExtension) {
+      // _buildRuntime restores runtime flags even if imports omitted this extension.
+      for (const [name, value] of restoredFlags ?? []) flagValues.set(name, value);
+      return;
+    }
     const ownCommands = commands;
     const extension = (await import(`../index.ts?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
     extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, command) => commands.set(name, command),
@@ -119,6 +123,7 @@ export async function harness(t, options = {}) {
   });
   const h = {
     home, sent, network, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    get handlers() { return handlers; },
     get factoryFlag() { return factoryFlag; }, get factoryTools() { return factoryTools; },
     get registrations() { return registrations; }, get tools() { return tools; }, get ctx() { return ctx; },
     diagnostic: async () => (await tools.get('telegram_diagnostics').execute('diag', {}, undefined, undefined, ctx)).details,

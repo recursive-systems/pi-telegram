@@ -80,11 +80,17 @@ Preparation age covers the current uninterrupted batch; queued age starts after
 attachment preparation. Ages use the process wall clock.
 
 `instance` and `loadedAt` identify this extension factory invocation. The lazy
-cached **checkout version is not proof of loaded code**.
+cached **checkout version is not proof of loaded code**. The UUID is factory
+identity, not immutable code attestation: even the same source creates a new UUID
+on reload. Status also retains reload/recovery, failed preparation/ingress counts,
+and uncertain-reply indicators; detail includes disconnected-restoration gates.
 
 For an optional model-readable snapshot, launch an approved test/session with
 `--telegram-diagnostics`. At `session_start` (after CLI/restored flags are
 applied), this registers `telegram_diagnostics` once per extension instance.
+The flag must be supplied when launching Pi; typing it into an existing session
+is not a runtime toggle. Reload restores the previous flag value onto the **new**
+factory before registration; disabled instances expose no diagnostics tool.
 It is a read-only tool with no arguments, returning the detailed lifecycle fields
 (without the command's checkout git lookup). It cannot connect, replay, reset, or send.
 The tool samples host state during its own calling turn; it cannot reconstruct
@@ -195,7 +201,13 @@ legacy peer dependency tree; npm's normal peer auto-install policy is unchanged.
 
 Formatter tests use the real public Pi-supplied Marked export. Queue tests use a
 temporary HOME, fake Pi lifecycle, mocked fetch, and fake timers. No bot,
-credentials, or model is used.
+credentials, or model is used. The combined suite retains 57 queue/diagnostic,
+33 reload, and 51 formatter regressions, plus 10 cross-feature integration cases.
+
+The historical Telegram stall remains **unproven**. Offline tests reproduce a
+specific missed-finalization mechanism, not the original incident. Recovery only
+reuses existing lifecycle drains for an actually observed settled event; it adds
+no heartbeat, scheduler, watchdog, broad retry loop, or general liveness guarantee.
 
 The formatter was compared offline with the original markdown-it renderer on
 40 expected-output fixtures. This is not a perfect CommonMark parity claim:
@@ -248,7 +260,12 @@ first assistant response is saved. Such fresh, memory-only sessions refuse
 handoff; let Pi save an assistant response before retrying.
 Unacknowledged submissions, suspended preflight, failed
 preparation/ingress, and uncertain outgoing replies **refuse** handoff rather
-than replay uncertain work. Concurrent requests coalesce.
+than replay uncertain work. Concurrent requests coalesce. If a completed reply
+still owes settlement during manual compaction, reload waits for host idle and
+may refuse while that active reply awaits its deferred drain. The original
+instance retains and finalizes it; retry the explicit handoff only after that
+finishes. Debt is never transferred as queued work. A finalization already in
+progress (including draft flush and attachments) remains a handoff barrier.
 
 A bounded (maximum 8 MiB, otherwise refused) `telegram-reload-checkpoint-v1`
 custom session entry stores only queued turns, hold state, cursor, and handoff
@@ -309,7 +326,9 @@ that subsequent network requests will succeed.
 ### At-home test procedure (only after review)
 
 No live installation or reload is part of the offline test suite. In a checkout
-of the reviewed branch, with Node 22.22+:
+of the reviewed branch, with Node 22.22+ and a private dependency directory
+**without shared package symlinks** (for the read-only host-symlink arrangement
+above, skip `npm ci` and run `npm test` only):
 
 ```bash
 npm ci --ignore-scripts
@@ -339,7 +358,10 @@ previous package pin. Do not run these steps unattended:
    supplies its peer APIs); do not enable dependency install scripts for this test.
    In the intended Pi session, do one **ordinary** `/reload`, then
    `/telegram-connect`. Check `/telegram-status` and Telegram `/version` against
-   the reviewed commit. Do not add a second package/extension copy.
+   the reviewed checkout, but treat those lazy version strings as checkout
+   provenance, **not loaded-SHA attestation**. Record the new factory UUID from
+   status after reload; it confirms a new factory, not exact source bytes.
+   Do not add a second package/extension copy.
 3. Send a small Telegram request, then two distinguishable follow-ups (one with
    an image/file). While it runs, issue local `/telegram-reload`. Confirm the
    current reply/files finish first, the fresh local status reports restoration,
