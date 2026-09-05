@@ -19,24 +19,26 @@ export async function harness(t, options = {}) {
   process.env.HOME = home;
   await mkdir(join(home, '.pi/agent'), { recursive: true });
   await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0 }));
-  let handlers, commands, tools, ctx, invalidate;
+  let handlers, commands, tools, ctx, invalidate, flagValues, registrations, factoryTools, factoryFlag;
+  let restoredFlags;
   const sent = [], network = [], statuses = [], errors = [], notices = [], entries = [], submissions = [], lifecycle = [], serverUpdates = [];
   let generation = 0, activePolls = 0, maxPolls = 0, idleWaiter = deferred(), reloadHook = async () => {}, appendHook = () => {};
   let sessionId = 'fake-session', sessionFile = join(home, 'session.jsonl');
   // Real Pi may name a fresh session before it has ever flushed a JSONL file.
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
   let reloadMode = 'normal';
-  let idle = true, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
+  let idle = true, compacting = false, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
   const emit = async (name, event = {}) => handlers.get(name)?.({ type: name, ...event }, ctx);
   async function instantiate(omitExtension = false) {
     handlers = new Map(); commands = new Map(); tools = new Map();
+    flagValues = new Map(); registrations = []; factoryTools = [];
     let valid = true;
     const check = () => assert.ok(valid, 'stale host API used');
     invalidate = () => { valid = false; };
     const ownCtx = ctx = {
-      isIdle: () => { check(); return idle; }, hasPendingMessages: () => { check(); return pending; },
+      isIdle: () => { check(); return idle && !compacting; }, hasPendingMessages: () => { check(); return pending; },
       abort: () => { check(); h.aborts++; },
-      waitForIdle: async () => { check(); if (!idle) await idleWaiter.promise; },
+      waitForIdle: async () => { check(); if (!idle || compacting) await idleWaiter.promise; },
       sessionManager: { getEntries: () => { check(); return entries; }, getSessionId: () => { check(); return sessionId; },
         getSessionFile: () => { check(); return sessionFile; } },
       ui: { theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
@@ -47,6 +49,7 @@ export async function harness(t, options = {}) {
           await reloadHook('before');
           await emit('session_shutdown', { reason: 'reload' }); lifecycle.push('shutdown'); invalidate();
           await reloadHook('after');
+          restoredFlags = new Map(flagValues);
           await instantiate(reloadMode === 'omit-extension'); lifecycle.push('instantiate');
           await emit('session_start', { reason: 'reload' }); lifecycle.push('start');
         } catch (error) {
@@ -61,7 +64,9 @@ export async function harness(t, options = {}) {
     const ownCommands = commands;
     const extension = (await import(`../index.ts?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
     extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, command) => commands.set(name, command),
-      registerTool: tool => tools.set(tool.name, tool),
+      registerFlag: (name, options) => { if (!flagValues.has(name)) flagValues.set(name, options.default); },
+      getFlag: name => { check(); return flagValues.get(name); },
+      registerTool: tool => { check(); registrations.push(tool.name); tools.set(tool.name, tool); },
       appendEntry: (customType, data) => {
         check(); appendHook(customType);
         const entry = { type: 'custom', customType, data: structuredClone(data) };
@@ -79,6 +84,11 @@ export async function harness(t, options = {}) {
         sent.push(content); onSend(content);
       },
     });
+    factoryTools.push(...tools.keys());
+    factoryFlag = flagValues.get('telegram-diagnostics');
+    // Host factories see defaults; CLI overrides/restored flags precede startup.
+    if (restoredFlags) for (const [name, value] of restoredFlags) flagValues.set(name, value);
+    else flagValues.set('telegram-diagnostics', options.diagnosticsEnabled ?? true);
   }
   t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
     assert.ok(/^https:\/\/api.telegram.org\/(file\/)?botFAKE-OFFLINE\//.test(String(url)), 'only fake bot URLs allowed');
@@ -109,6 +119,10 @@ export async function harness(t, options = {}) {
   });
   const h = {
     home, sent, network, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    get factoryFlag() { return factoryFlag; }, get factoryTools() { return factoryTools; },
+    get registrations() { return registrations; }, get tools() { return tools; }, get ctx() { return ctx; },
+    diagnostic: async () => (await tools.get('telegram_diagnostics').execute('diag', {}, undefined, undefined, ctx)).details,
+    status: async (args = '') => { await commands.get('telegram-status').handler(args, ctx); return notices.at(-1).text; },
     serverMessage(text, extra = {}) {
       const id = ++updateId;
       serverUpdates.push({ update_id: id, message: { message_id: id, chat: { id: 70, type: 'private' }, from: { id: 7 }, text, ...extra } });
@@ -120,7 +134,7 @@ export async function harness(t, options = {}) {
     command: (name, args = '') => commands.get(name).handler(args, ctx),
     reloadTool: () => tools.get('telegram_reload').execute('call', {}),
     async replace(reason) {
-      await emit('session_shutdown', { reason }); invalidate(); await instantiate(); await emit('session_start', { reason });
+      await emit('session_shutdown', { reason }); invalidate(); restoredFlags = new Map(flagValues); await instantiate(); await emit('session_start', { reason });
     },
     // Real Pi wrapper returns void; promise rejection goes to the error listener.
     asyncAdmission(preflight = async () => {}, transform = x => x) {
@@ -143,6 +157,7 @@ export async function harness(t, options = {}) {
       await immediate(); await immediate();
     },
     async start(content = sent.at(-1)) {
+      assert.equal(compacting, false, 'Pi rejects fresh prompts during compaction before before_agent_start');
       const prompt = typeof content === 'string' ? content : content.filter(p => p.type === 'text').map(p => p.text).join('\n');
       await emit('before_agent_start', { prompt, systemPrompt: '' });
       await beforeStart(prompt);
@@ -150,13 +165,38 @@ export async function harness(t, options = {}) {
       await emit('message_start', { message: { role: 'user', content: [{ type: 'text', text: prompt }] } });
     },
     async end(text = 'answer', reason = 'stop') { await emit('agent_end', { messages: [assistant(text, reason)] }); },
-    async settle() { idle = true; await emit('agent_settled'); idleWaiter.resolve(); idleWaiter = deferred(); await immediate(); },
+    // Host clears runActive before awaited settled observers run.
+    async settle(earlierListener = async () => {}) {
+      idle = true; await earlierListener(); await emit('agent_settled');
+      if (!compacting) { idleWaiter.resolve(); idleWaiter = deferred(); }
+      await immediate();
+    },
+    async beginManualCompaction() {
+      assert.equal(ctx.isIdle(), true);
+      compacting = true;
+      await emit('session_before_compact', { reason: 'manual', willRetry: false });
+    },
+    async completeManualCompaction(laterListener = async () => {}, afterCleanup = async () => {}) {
+      await emit('session_compact', { reason: 'manual', willRetry: false });
+      await laterListener(); // success cleanup follows all awaited hooks
+      compacting = false;
+      await afterCleanup(); // queued input may start before the deferred drain
+      idleWaiter.resolve(); idleWaiter = deferred();
+      await immediate();
+    },
+    async failManualCompaction() {
+      compacting = false;
+      await emit('session_compact_failed', { reason: 'manual', willRetry: false, aborted: true });
+      idleWaiter.resolve(); idleWaiter = deferred();
+      await immediate();
+    },
+    set compacting(value) { compacting = value; },
     attach: paths => tools.get('telegram_attach').execute('call', { paths }),
     async shutdown() { await emit('session_shutdown'); },
   };
   t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; await rm(home, { recursive: true, force: true }); });
   await instantiate();
-  await emit('session_start', { reason: 'startup' });
+  await emit('session_start', { reason: options.sessionReason ?? 'startup' });
   if (options.connected !== false) {
     await commands.get('telegram-connect').handler('', ctx);
     await until(() => poll);

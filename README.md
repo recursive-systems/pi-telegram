@@ -65,6 +65,34 @@ Check status:
 /telegram-status
 ```
 
+Status is content-free: queue/admission/preflight/active/finalization/hold flags,
+host idle/pending flags and phase ages. Use `/telegram-status detail` for all
+fields and the last 16 lifecycle observations.
+`queued` includes a submitted turn until its matching preflight claims it;
+`active: false` and `queued: 0` do **not** mean outbound delivery has finished.
+`finalizing`, `finalizationStage`, and detailed `previewFlushing` distinguish that wait.
+`settlementOwed` means a settled event was observed but its finalization gate
+was blocked. Existing lifecycle wakes can retry it after manual compaction; a
+new agent run supersedes it and must settle in its own right. Compaction alone
+never creates settlement debt.
+`blocker` reports the current admission gate, not a diagnosis of the host.
+Preparation age covers the current uninterrupted batch; queued age starts after
+attachment preparation. Ages use the process wall clock.
+
+`instance` and `loadedAt` identify this extension factory invocation. The lazy
+cached **checkout version is not proof of loaded code**.
+
+For an optional model-readable snapshot, launch an approved test/session with
+`--telegram-diagnostics`. At `session_start` (after CLI/restored flags are
+applied), this registers `telegram_diagnostics` once per extension instance.
+It is a read-only tool with no arguments, returning the detailed lifecycle fields
+(without the command's checkout git lookup). It cannot connect, replay, reset, or send.
+The tool samples host state during its own calling turn; it cannot reconstruct
+an earlier idle snapshot beyond the bounded previous lifecycle observations.
+Metadata stays in memory; explicitly requested tool results may be retained by
+Pi like any other tool result. No message text, Telegram identifiers, paths,
+tokens, URLs, or network errors are included.
+
 ## Pair your Telegram account
 
 After token setup and `/telegram-connect`:

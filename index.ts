@@ -197,10 +197,7 @@ const execFileAsync = promisify(execFile);
 let cachedExtensionVersion: string | null = null;
 
 /**
- * Best-effort git version of the running extension code, cached for the
- * session. Reports the short SHA plus " (dirty)" when the working tree
- * has uncommitted changes, so dogfooding sessions can verify exactly
- * what they are running.
+ * Lazy, cached checkout metadata only. This is NOT loaded-code provenance.
  */
 async function getExtensionVersion(): Promise<string> {
 	if (cachedExtensionVersion !== null) return cachedExtensionVersion;
@@ -216,7 +213,7 @@ async function getExtensionVersion(): Promise<string> {
 		}
 		cachedExtensionVersion = `${sha}${dirty ? " (dirty)" : ""}`;
 	} catch {
-		cachedExtensionVersion = `unknown (no git metadata in ${EXTENSION_DIR})`;
+		cachedExtensionVersion = "unknown (no git metadata)";
 	}
 	return cachedExtensionVersion;
 }
@@ -369,6 +366,10 @@ export default function (pi: ExtensionAPI) {
 	let drainTimer: ReturnType<typeof setImmediate> | undefined;
 	let compactionWakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let finalizingReply = false;
+	// A real settled event was observed, but its finalization gate may have been
+	// busy (e.g. manual compaction started in an earlier awaited listener).
+	// Only existing lifecycle drains can retry this debt; agent_start supersedes it.
+	let settlementOwed = false;
 	let lastTelegramAssistant: ReturnType<typeof extractAssistantText> = {};
 	let closed = false;
 	const sessionController = new AbortController();
@@ -382,6 +383,66 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+
+	// Diagnostics contain only fixed labels, counts, booleans and times. No content
+	// or external error strings; never persisted or used to make routing decisions.
+	const loadedAt = new Date().toISOString();
+	const instance = randomUUID();
+	const queuedAt = new WeakMap<PendingTelegramTurn, number>();
+	const phaseSince = new Map<string, number>();
+	const lifecycle: { event: string; at: number; hostIdle?: boolean; hostPending?: boolean }[] = [];
+	let preparationCount = 0;
+	let finalizationStage = "none";
+	function phases() {
+		return { submitted: !!submittedTelegramTurn, preflight: preflightPending,
+			active: !!activeTelegramTurn, finalizing: finalizingReply,
+			held: preserveQueuedTurnsAsHistory, preparing: preparationCount > 0 };
+	}
+	function transition(event: string, ctx?: ExtensionContext): void {
+		const now = Date.now();
+		for (const [phase, present] of Object.entries(phases())) {
+			if (!present) phaseSince.delete(phase);
+			else if (!phaseSince.has(phase)) phaseSince.set(phase, now);
+		}
+		lifecycle.push({ event, at: now, ...(ctx ? { hostIdle: ctx.isIdle(), hostPending: ctx.hasPendingMessages() } : {}) });
+		if (lifecycle.length > 16) lifecycle.shift();
+	}
+	function diagnostics(ctx: ExtensionContext) {
+		const now = Date.now();
+		const hostIdle = ctx.isIdle(), hostPending = ctx.hasPendingMessages();
+		const state = phases();
+		const blocker = closed ? "closed" : state.preflight ? "preflight" : state.held ? "held" :
+			state.submitted ? "submitted" : state.active ? "active-awaiting-settlement" :
+			state.finalizing ? "finalizing" : !hostIdle ? "host-busy" : hostPending ? "host-pending" :
+			queuedTelegramTurns.length ? "awaiting-drain" : state.preparing ? "preparing" : "none";
+		return { instance, loadedAt, closed, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
+			queued: queuedTelegramTurns.length, ...state, preparationCount,
+			routingTelegram, awaitingTelegramStart, settlementOwed, finalizationStage,
+			previewFlushing: !!previewState?.flushing, previewScheduled: !!previewState?.flushTimer,
+			drainScheduled: !!drainTimer, compactionWakeScheduled: !!compactionWakeTimer,
+			hostIdle, hostPending, blocker,
+			agesMs: { ...Object.fromEntries([...phaseSince].filter(([key]) => state[key as keyof typeof state]).map(([key, at]) => [key, Math.max(0, now - at)])),
+				queued: queuedTelegramTurns.length ? Math.max(0, now - (queuedAt.get(queuedTelegramTurns[0]) ?? now)) : null },
+			lifecycle: lifecycle.map(({ at, ...metadata }) => ({ ...metadata, ageMs: Math.max(0, now - at) })) };
+	}
+	pi.registerFlag("telegram-diagnostics", {
+		description: "Expose the read-only, content-free telegram_diagnostics tool", type: "boolean", default: false,
+	});
+	let diagnosticsRegistered = false;
+	function registerDiagnosticsTool(): void {
+		if (closed || diagnosticsRegistered || pi.getFlag("telegram-diagnostics") !== true) return;
+		pi.registerTool({
+			name: "telegram_diagnostics", label: "Telegram Diagnostics",
+			description: "Read bounded Telegram bridge lifecycle metadata. Does not connect, reset, replay or send messages. Host state is sampled during this tool call, not before the calling turn.",
+			parameters: Type.Object({}),
+			async execute(_id, _params, _signal, _onUpdate, ctx) {
+				const details = diagnostics(ctx);
+				return { content: [{ type: "text", text: JSON.stringify(details) }], details };
+			},
+		});
+
+		diagnosticsRegistered = true;
+	}
 
 	function allocateDraftId(): number {
 		nextDraftId = nextDraftId >= TELEGRAM_DRAFT_ID_MAX ? 1 : nextDraftId + 1;
@@ -871,6 +932,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (lower === "stop" || lower === "/stop") {
 			preserveQueuedTurnsAsHistory = true;
+			transition("stop-held");
 			stopGeneration++;
 			if (currentAbort) {
 				currentAbort();
@@ -978,6 +1040,8 @@ export default function (pi: ExtensionAPI) {
 		// Reserve FIFO at arrival, before album debounce or any download. Commands
 		// remain outside this chain so /stop can interrupt preparation.
 		const arrivalGeneration = stopGeneration;
+		preparationCount++;
+		transition("preparation-start");
 		const preparing = preparingTurns.then(async () => {
 			await ready;
 			if (closed) return;
@@ -989,13 +1053,16 @@ export default function (pi: ExtensionAPI) {
 			// A download begun before /stop must never release its hold.
 			if (arrivalGeneration === stopGeneration) preserveQueuedTurnsAsHistory = false;
 			queuedTelegramTurns.push(turn);
+			queuedAt.set(turn, Date.now());
+			transition("enqueued");
 			updateStatus(ctx);
 			drainTelegramQueue(ctx);
 		});
 		preparingTurns = preparing.catch(() => {
+			transition("preparation-failed");
 			failedPreparations.push(structuredClone(messages));
 			updateStatus(ctx, "attachment preparation failed; work retained, dispatch blocked");
-		});
+		}).finally(() => { preparationCount--; transition("preparation-finished"); });
 	}
 
 	function drainTelegramQueue(ctx: ExtensionContext): void {
@@ -1004,7 +1071,10 @@ export default function (pi: ExtensionAPI) {
 		// cleanup and other extensions' hooks), then recheck admission once.
 		drainTimer = setImmediate(() => {
 			drainTimer = undefined;
-			submitNextTelegramTurn(ctx);
+			if (settlementOwed) {
+				// Recheck host/preflight gates in the same deferred callback as admission.
+				if (!ctx.hasPendingMessages()) void finalizeSettledTelegramTurn(ctx);
+			} else submitNextTelegramTurn(ctx);
 		});
 	}
 
@@ -1028,12 +1098,14 @@ export default function (pi: ExtensionAPI) {
 		const turn = queuedTelegramTurns[0];
 		if (!turn) return;
 		submittedTelegramTurn = turn;
+		transition("submitted");
 		updateStatus(ctx);
 		try {
 			pi.sendUserMessage(turn.content);
 		} catch (error) {
 			// A synchronous rejection did not accept the turn. Keep it in FIFO order.
 			if (submittedTelegramTurn === turn) submittedTelegramTurn = undefined;
+			transition("submission-sync-rejected");
 			updateStatus(ctx, `submission failed: ${String(error)}`);
 		}
 	}
@@ -1314,20 +1386,21 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("telegram-status", {
-		description: "Show Telegram bridge status",
-		handler: async (_args, ctx) => {
-			const status = [
-				`version: ${await getExtensionVersion()}`,
-				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
-				`allowed user: ${config.allowedUserId ?? "not paired"}`,
-				`polling: ${pollingPromise ? "running" : "stopped"}`,
-				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
-				`queued telegram turns: ${queuedTelegramTurns.length}`,
-				`reload: ${recoveryRequired ? "recovery required" : reloadPending ? "pending" : "none"}`,
+		description: "Show Telegram bridge gates and ages (detail: full bounded lifecycle history)",
+		handler: async (args, ctx) => {
+			const checkoutVersion = await getExtensionVersion();
+			const snapshot = diagnostics(ctx);
+			const { instance, loadedAt, configured, paired, polling, blocker, queued, submitted, preflight, active, finalizing,
+				held, settlementOwed, finalizationStage, hostIdle, hostPending, agesMs } = snapshot;
+			const view = args.trim() === "detail" ? snapshot : { instance, loadedAt, configured, paired, polling, blocker, queued,
+				submitted, preflight, active, finalizing, held, settlementOwed, finalizationStage,
+				hostIdle, hostPending, agesMs };
+			const status = Object.entries(view).map(([key, value]) =>
+				`${key}: ${typeof value === "object" ? JSON.stringify(value) : value}`);
+			status.push(`reload: ${recoveryRequired ? "recovery required" : reloadPending ? "pending" : "none"}`,
 				`failed preparations/ingress: ${failedPreparations.length}/${failedIngress.length}`,
-				`uncertain reply: ${uncertainReply ? "yes" : "no"}`,
-			];
-			ctx.ui.notify(status.join(" | "), "info");
+				`uncertain reply: ${uncertainReply ? "yes" : "no"}`);
+			ctx.ui.notify(`checkout version (lazy cached, not loaded code): ${checkoutVersion} | ${status.join(" | ")}`, "info");
 		},
 	});
 
@@ -1357,6 +1430,9 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		// CLI/restored flags are applied after the factory, before session_start.
+		registerDiagnosticsTool();
+		transition("session-start");
 		if (restoreStarted) return;
 		restoreStarted = true;
 		if (event.reason !== "reload") {
@@ -1427,6 +1503,8 @@ export default function (pi: ExtensionAPI) {
 			if (permit) permit.armed = event.reason === "reload";
 		}
 		closed = true;
+		settlementOwed = false;
+		transition("shutdown");
 		sessionController.abort();
 		if (drainTimer) clearImmediate(drainTimer);
 		drainTimer = undefined;
@@ -1463,14 +1541,17 @@ export default function (pi: ExtensionAPI) {
 			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 			startTypingLoop(ctx);
 		}
+		transition("before-agent-start", ctx);
 		return { systemPrompt: event.systemPrompt + SYSTEM_PROMPT_SUFFIX +
 			(routingTelegram ? "\n- The current user message came from Telegram." : "") };
 	});
 
 	pi.on("agent_start", async (_event, ctx) => {
 		if (closed) return;
+		settlementOwed = false;
 		awaitingTelegramStart = false;
 		preflightPending = false;
+		transition("agent-start", ctx);
 		if (compactionWakeTimer) clearTimeout(compactionWakeTimer);
 		compactionWakeTimer = undefined;
 		currentAbort = () => ctx.abort();
@@ -1506,25 +1587,44 @@ export default function (pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("agent_end", async (event) => {
+	pi.on("agent_end", async (event, ctx) => {
+		if (!closed) transition("agent-end", ctx);
 		if (routingTelegram && activeTelegramTurn) lastTelegramAssistant = extractAssistantText(event.messages);
 	});
 
+	pi.on("session_before_compact", (event, ctx) => {
+		if (!closed) transition(event.reason === "manual" ? "manual-compaction-start" : "auto-compaction-start", ctx);
+	});
 	pi.on("session_compact", (event, ctx) => {
+		if (!closed) transition(event.reason === "manual" ? "manual-compaction-complete" : "auto-compaction-complete", ctx);
 		if (event.reason === "manual") wakeAfterManualCompaction(ctx);
 		else drainTelegramQueue(ctx);
 	});
-	pi.on("session_compact_failed", (_event, ctx) => { drainTelegramQueue(ctx); });
+	pi.on("session_compact_failed", (_event, ctx) => {
+		if (!closed) transition("compaction-failed", ctx);
+		drainTelegramQueue(ctx);
+	});
 
 	pi.on("agent_settled", async (_event, ctx) => {
+		if (!closed) {
+			settlementOwed = !!activeTelegramTurn;
+			transition("agent-settled-observed", ctx);
+		}
+		await finalizeSettledTelegramTurn(ctx);
+	});
+
+	async function finalizeSettledTelegramTurn(ctx: ExtensionContext): Promise<void> {
 		if (closed || preflightPending || finalizingReply || awaitingTelegramStart || !ctx.isIdle()) return;
 		const turn = activeTelegramTurn;
+		settlementOwed = false;
 		currentAbort = undefined;
 		stopTypingLoop();
 		activeTelegramTurn = undefined;
 		routingTelegram = false;
 		if (!turn) { drainTelegramQueue(ctx); return; }
 		finalizingReply = true;
+		finalizationStage = "preview-or-text";
+		transition("finalization-start");
 		updateStatus(ctx);
 		let replyError: string | undefined;
 		try {
@@ -1556,17 +1656,22 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
+			finalizationStage = "attachments";
 			await sendQueuedAttachments(turn);
 
 		} catch (error) {
 			uncertainReply = turn;
+			transition("finalization-failed");
 			replyError = `reply failed: ${String(error)}`;
 		} finally {
+			finalizationStage = "preview-cleanup";
 			await clearPreview(turn.chatId);
 			finalizingReply = false;
 			for (const resolve of replyWaiters.splice(0)) resolve();
+			finalizationStage = "none";
+			transition("finalization-finished");
 			updateStatus(ctx, replyError);
 			drainTelegramQueue(ctx);
 		}
-	});
+	}
 }
