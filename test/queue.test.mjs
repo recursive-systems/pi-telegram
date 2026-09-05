@@ -1,90 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
-
-const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
-async function until(check) {
-  for (let i = 0; i < 10000; i++) { if (check()) return; await immediate(); }
-  assert.fail('fake lifecycle did not reach expected boundary');
-}
-const assistant = (text = 'answer', stopReason = 'stop') => ({ role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage: 'model failed' });
-
-async function harness(t) {
-  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
-  const home = await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
-  const oldHome = process.env.HOME;
-  process.env.HOME = home;
-  await mkdir(join(home, '.pi/agent'), { recursive: true });
-  await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0 }));
-  const handlers = new Map(), commands = new Map(), tools = new Map(), sent = [], network = [], statuses = [], errors = [];
-  let idle = true, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
-  const ctx = { isIdle: () => idle, hasPendingMessages: () => pending, abort: () => { h.aborts++; },
-    ui: { theme: { fg: (_color, text) => text }, setStatus: (_key, text) => statuses.push(text), notify() {} } };
-  const emit = async (name, event = {}) => handlers.get(name)?.({ type: name, ...event }, ctx);
-  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
-    assert.ok(/^https:\/\/api.telegram.org\/(file\/)?botFAKE-OFFLINE\//.test(String(url)), 'only fake bot URLs allowed');
-    if (String(url).includes('/file/')) {
-      network.push({ method: 'download', body: {} });
-      if (networkGate) await networkGate('download', {}, options.signal);
-      return { ok: true, arrayBuffer: async () => new TextEncoder().encode('offline attachment').buffer };
-    }
-    const method = String(url).split('/').at(-1);
-    const body = options.body instanceof FormData ? Object.fromEntries(options.body) : JSON.parse(options.body || '{}');
-    network.push({ method, body });
-    if (method === 'getUpdates') {
-      const request = deferred(); poll = request;
-      options.signal.addEventListener('abort', () => request.reject(new DOMException('aborted', 'AbortError')), { once: true });
-      return { json: async () => ({ ok: true, result: await request.promise }) };
-    }
-    if (networkGate) await networkGate(method, body, options.signal);
-    return { json: async () => ({ ok: true, result: method === 'getFile' ? { file_path: 'fake.txt' } : { message_id: network.length } }) };
-  });
-  const extension = (await import(`../index.ts?home=${encodeURIComponent(home)}`)).default;
-  extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, command) => commands.set(name, command),
-    registerTool: tool => tools.set(tool.name, tool), sendUserMessage: content => { sent.push(content); onSend(content); } });
-  const h = {
-    home, sent, network, statuses, errors, emit, aborts: 0,
-    // Real Pi wrapper returns void; promise rejection goes to the error listener.
-    asyncAdmission(preflight = async () => {}, transform = x => x) {
-      onSend = content => {
-        void (async () => {
-          if (await preflight(content) === 'handled') return;
-          await h.start(transform(content));
-        })().catch(error => errors.push(error));
-      };
-    },
-    set idle(value) { idle = value; }, set pending(value) { pending = value; }, set onSend(value) { onSend = value; },
-    set networkGate(value) { networkGate = value; },
-    set beforeStart(value) { beforeStart = value; },
-    async receive(text, extra = {}) {
-      await until(() => poll);
-      const request = poll; poll = undefined;
-      const id = ++updateId;
-      request.resolve([{ update_id: id, message: { message_id: id, chat: { id: 70, type: 'private' }, from: { id: 7 }, text, ...extra } }]);
-      await until(() => poll);
-      await immediate(); await immediate();
-    },
-    async start(content = sent.at(-1)) {
-      const prompt = typeof content === 'string' ? content : content.filter(p => p.type === 'text').map(p => p.text).join('\n');
-      await emit('before_agent_start', { prompt, systemPrompt: '' });
-      await beforeStart(prompt);
-      idle = false; await emit('agent_start');
-      await emit('message_start', { message: { role: 'user', content: [{ type: 'text', text: prompt }] } });
-    },
-    async end(text = 'answer', reason = 'stop') { await emit('agent_end', { messages: [assistant(text, reason)] }); },
-    async settle() { idle = true; await emit('agent_settled'); await immediate(); },
-    attach: paths => tools.get('telegram_attach').execute('call', { paths }),
-    async shutdown() { await emit('session_shutdown'); },
-  };
-  t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; await rm(home, { recursive: true, force: true }); });
-  await emit('session_start');
-  await commands.get('telegram-connect').handler('', ctx);
-  await until(() => poll);
-  return h;
-}
+import { harness, deferred, until, assistant } from './harness.mjs';
 
 test('non-Telegram busy turn drains only at settled; unrelated starts cannot claim queue', async t => {
   const h = await harness(t);

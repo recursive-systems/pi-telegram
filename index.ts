@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, createHmac, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
@@ -160,6 +160,31 @@ interface TelegramMediaGroupState {
 	flushTimer?: ReturnType<typeof setTimeout>;
 }
 
+// Only a live, one-shot capability can authorize restoration. Session entries alone
+// (including copied/forked entries) never authorize a connection. No credentials here.
+interface ReloadCheckpoint {
+	version: 1;
+	reason: "telegram-reload";
+	nonce: string;
+	sessionId: string;
+	sessionFile: string;
+	configDigest: string;
+	connected: boolean;
+	cursor?: number;
+	held: boolean;
+	stopGeneration: number;
+	turns: PendingTelegramTurn[];
+}
+interface ReloadPermit { digest: string; armed: boolean; expires: number }
+const reloadKey = Symbol.for("pi-telegram.explicit-reload.v1");
+const processState = globalThis as typeof globalThis & { [reloadKey]?: { key: string; permits: Map<string, ReloadPermit> } };
+const reloadState = processState[reloadKey] ??= { key: randomUUID(), permits: new Map() };
+const CHECKPOINT_TYPE = "telegram-reload-checkpoint-v1";
+const CLAIM_TYPE = "telegram-reload-claim-v1";
+const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const configDigest = (config: TelegramConfig) => createHmac("sha256", reloadState.key)
+	.update(JSON.stringify([config.botToken, config.botId, config.botUsername, config.allowedUserId])).digest("hex");
+
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
@@ -320,6 +345,16 @@ async function writeConfig(config: TelegramConfig): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
+	let reloadPending = false;
+	let reloadRunning = false;
+	let checkpoint: ReloadCheckpoint | undefined;
+	let restoreStarted = false;
+	let recoveryRequired = false;
+	let restoredDisconnected = false;
+	let uncertainReply: ActiveTelegramTurn | undefined;
+	const failedPreparations: TelegramMessage[][] = [];
+	const failedIngress: TelegramUpdate[] = [];
+	const replyWaiters: Array<() => void> = [];
 	let pollingController: AbortController | undefined;
 	let pollingPromise: Promise<void> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
@@ -624,6 +659,7 @@ export default function (pi: ExtensionAPI) {
 					attachment.fileName,
 				);
 			} catch (error) {
+				uncertainReply = turn;
 				const message = error instanceof Error ? error.message : String(error);
 				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
 			}
@@ -728,7 +764,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
-		if (!ctx.hasUI || setupInProgress) return;
+		if (!ctx.hasUI || setupInProgress || reloadPending) return;
 		setupInProgress = true;
 		try {
 			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
@@ -956,7 +992,10 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 			drainTelegramQueue(ctx);
 		});
-		preparingTurns = preparing.catch((error) => updateStatus(ctx, String(error)));
+		preparingTurns = preparing.catch(() => {
+			failedPreparations.push(structuredClone(messages));
+			updateStatus(ctx, "attachment preparation failed; work retained, dispatch blocked");
+		});
 	}
 
 	function drainTelegramQueue(ctx: ExtensionContext): void {
@@ -984,7 +1023,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function submitNextTelegramTurn(ctx: ExtensionContext): void {
-		if (closed || preflightPending || preserveQueuedTurnsAsHistory || submittedTelegramTurn || activeTelegramTurn || finalizingReply ||
+		if (closed || reloadPending || restoredDisconnected || failedPreparations.length || failedIngress.length || preflightPending || preserveQueuedTurnsAsHistory || submittedTelegramTurn || activeTelegramTurn || finalizingReply ||
 			!ctx.isIdle() || ctx.hasPendingMessages()) return;
 		const turn = queuedTelegramTurns[0];
 		if (!turn) return;
@@ -1055,10 +1094,8 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const updates = await callTelegram<TelegramUpdate[]>("getUpdates", { offset: -1, limit: 1, timeout: 0 }, { signal });
 				const last = updates.at(-1);
-				if (last) {
-					config.lastUpdateId = last.update_id;
-					await writeConfig(config);
-				}
+				config.lastUpdateId = last?.update_id ?? 0;
+				await writeConfig(config);
 			} catch {
 				// ignore
 			}
@@ -1078,9 +1115,14 @@ export default function (pi: ExtensionAPI) {
 				);
 				for (const update of updates) {
 					if (closed || signal.aborted) return;
-					config.lastUpdateId = update.update_id;
-					await writeConfig(config);
-					await handleUpdate(update, ctx);
+					try {
+						config.lastUpdateId = update.update_id;
+						await writeConfig(config);
+						await handleUpdate(update, ctx);
+					} catch (error) {
+						failedIngress.push(update);
+						throw error;
+					}
 				}
 			} catch (error) {
 				if (signal.aborted) return;
@@ -1098,7 +1140,8 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
-		if (closed || !config.botToken || pollingPromise) return;
+		if (closed || reloadPending || !config.botToken || pollingPromise) return;
+		restoredDisconnected = false;
 		pollingController = new AbortController();
 		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
 			pollingPromise = undefined;
@@ -1106,7 +1149,126 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 		});
 		updateStatus(ctx);
+		drainTelegramQueue(ctx);
 	}
+
+	function refuseReload(ctx: ExtensionContext): boolean {
+		if (uncertainReply || submittedTelegramTurn || preflightPending || failedPreparations.length || failedIngress.length || setupInProgress) {
+			ctx.ui.notify("Telegram reload refused: unacknowledged/preflight, uncertain reply, or failed preparation work. Preserve affected messages before ordinary teardown; no automatic replay.", "error");
+			return true;
+		}
+		return false;
+	}
+
+	pi.registerCommand("telegram-reload", {
+		description: "Explicit runtime reload with a one-shot Telegram queue handoff (does not upgrade source)",
+		handler: async (_args, ctx) => {
+			if (closed || reloadRunning || recoveryRequired) return;
+			reloadPending = true;
+			reloadRunning = true;
+			let stopped = false;
+			try {
+				if (refuseReload(ctx)) { reloadPending = false; reloadRunning = false; return; }
+				await ctx.waitForIdle();
+				if (finalizingReply) await new Promise<void>(resolve => replyWaiters.push(resolve));
+				if (closed) return;
+				if (refuseReload(ctx) || activeTelegramTurn || !ctx.isIdle() || ctx.hasPendingMessages())
+					throw new Error("not safe");
+				const connected = !!pollingPromise;
+				if (connected && config.lastUpdateId === undefined) throw new Error("initial polling cursor not ready");
+				const sessionId = ctx.sessionManager.getSessionId();
+				const sessionFile = ctx.sessionManager.getSessionFile();
+				if (!sessionFile) throw new Error("persistent session required");
+				// Pi can allocate a filename before its first assistant message flushes
+				// anything. Don't promise file-based recovery for an in-memory-only log.
+				const persisted = await stat(sessionFile).then(info => info.isFile(), () => false);
+				if (closed) return;
+				if (!persisted) {
+					reloadPending = false;
+					reloadRunning = false;
+					ctx.ui.notify("Telegram reload refused: session file is not persisted yet. Let Pi save an assistant response before retrying; queued work remains in this instance.", "error");
+					return;
+				}
+				// Abort ONLY polling, not the session signal used by ingress/downloads/replies.
+				stopped = true;
+				// If handoff fails after quiescing, unrelated idle events must not
+				// silently run a disconnected queue. Explicit connect releases it.
+				restoredDisconnected = true;
+				await stopPolling();
+				for (const state of mediaGroups.values()) {
+					if (state.flushTimer) clearTimeout(state.flushTimer);
+					state.ready();
+				}
+				mediaGroups.clear();
+				await preparingTurns;
+				if (closed) return;
+				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
+					throw new Error("not safe after quiescing");
+				const diskConfig = await readConfig();
+				if (configDigest(diskConfig) !== configDigest(config) || diskConfig.lastUpdateId !== config.lastUpdateId) throw new Error("config changed");
+				if (closed) return;
+				// No async work between this final admission check and snapshot/reload.
+				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
+					throw new Error("not safe after config verification");
+				checkpoint = structuredClone({ version: 1, reason: "telegram-reload", nonce: randomUUID(), sessionId, sessionFile,
+					configDigest: configDigest(config), connected, cursor: config.lastUpdateId,
+					held: preserveQueuedTurnsAsHistory, stopGeneration, turns: queuedTelegramTurns });
+				// Bound session growth; never silently truncate private text or image inputs.
+				if (Buffer.byteLength(JSON.stringify(checkpoint)) > 8 * 1024 * 1024) throw new Error("checkpoint too large");
+				pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
+				reloadState.permits.set(checkpoint.nonce, { digest: digest(checkpoint), armed: false, expires: Date.now() + 120_000 });
+			} catch {
+				if (closed) return;
+				checkpoint = undefined;
+				reloadRunning = false;
+				reloadPending = false;
+				ctx.ui.notify(stopped
+					? "Telegram reload stopped before teardown. Queue/evidence retained locally; polling stopped. Resolve the problem and explicitly retry /telegram-reload or /telegram-connect."
+					: "Telegram reload refused before teardown. Work retained; wait for safe idle and retry.", "error");
+				return;
+			}
+			// Terminal: failures after runtime invalidation are reported by the host, not
+			// through captured stale pi/ctx. The immutable checkpoint remains in the session.
+			const reloadNonce = checkpoint?.nonce;
+			try { await ctx.reload(); }
+			catch {
+				if (!closed) {
+					reloadRunning = false;
+					reloadPending = false;
+					ctx.ui.notify("Telegram runtime reload failed before shutdown; queue retained and polling stopped. Explicit retry required.", "error");
+					return;
+				}
+				// The host error channel owns reporting after teardown; no stale API calls.
+				throw new Error("Telegram runtime reload failed after teardown. Private session checkpoint retained; reconcile work manually before reconnecting.");
+			} finally {
+				// TUI reload/import failures can be diagnostics with a resolved promise.
+				// The capability belongs only to THIS operation, never a later /reload.
+				if (reloadNonce) reloadState.permits.delete(reloadNonce);
+				if (!closed && reloadRunning) {
+					reloadRunning = false;
+					reloadPending = false;
+					ctx.ui.notify("Telegram runtime was not replaced; queue retained and polling stopped. Explicit retry required.", "error");
+				}
+			}
+			return;
+		},
+	});
+
+	pi.registerTool({
+		name: "telegram_reload",
+		label: "Telegram Reload",
+		description: "Schedule /telegram-reload safely after the current turn and Telegram reply. ONLY call with explicit user authorization to reload this runtime. Never reload autonomously. Does not install or upgrade source.",
+		parameters: Type.Object({}),
+		async execute() {
+			if (!reloadPending && !closed) {
+				reloadPending = true;
+				// Command dispatch precedes streaming checks. Do not await it from the tool:
+				// the command itself waits for host idle, including this tool's final turn.
+				pi.sendUserMessage("/telegram-reload", { deliverAs: "followUp", expandPromptTemplates: true });
+			}
+			return { content: [{ type: "text", text: "Requested /telegram-reload; completion is reported locally. This is not an admission or reconnection acknowledgement." }], details: {} };
+		},
+	});
 
 	pi.registerTool({
 		name: "telegram_attach",
@@ -1161,6 +1323,9 @@ export default function (pi: ExtensionAPI) {
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
+				`reload: ${recoveryRequired ? "recovery required" : reloadPending ? "pending" : "none"}`,
+				`failed preparations/ingress: ${failedPreparations.length}/${failedIngress.length}`,
+				`uncertain reply: ${uncertainReply ? "yes" : "no"}`,
 			];
 			ctx.ui.notify(status.join(" | "), "info");
 		},
@@ -1169,6 +1334,10 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
+			if (reloadPending || recoveryRequired) {
+				ctx.ui.notify("Telegram handoff pending or recovery required; inspect the retained session checkpoint before any reconnect.", "error");
+				return;
+			}
 			config = await readConfig();
 			if (!config.botToken) {
 				await promptForConfig(ctx);
@@ -1187,13 +1356,76 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
-		config = await readConfig();
-		await mkdir(TEMP_DIR, { recursive: true });
-		updateStatus(ctx);
+	pi.on("session_start", async (event, ctx) => {
+		if (restoreStarted) return;
+		restoreStarted = true;
+		if (event.reason !== "reload") {
+			config = await readConfig();
+			await mkdir(TEMP_DIR, { recursive: true });
+			updateStatus(ctx);
+			return;
+		}
+		const entries = ctx.sessionManager.getEntries();
+		const entry = [...entries].reverse().find(e => e.type === "custom" && e.customType === CHECKPOINT_TYPE);
+		if (!entry || entry.type !== "custom") {
+			config = await readConfig();
+			await mkdir(TEMP_DIR, { recursive: true });
+			updateStatus(ctx);
+			return;
+		}
+		const saved = entry.data as ReloadCheckpoint;
+		const permit = saved && reloadState.permits.get(saved.nonce);
+		// Claim synchronously before any await, even when validation fails. Retain the
+		// original custom entry forever for deliberate manual recovery, not blind retry.
+		if (saved?.nonce) reloadState.permits.delete(saved.nonce);
+		if (!permit || !permit.armed || permit.expires < Date.now() || permit.digest !== digest(saved) ||
+			saved.version !== 1 || saved.reason !== "telegram-reload" || saved.sessionId !== ctx.sessionManager.getSessionId() ||
+			saved.sessionFile !== ctx.sessionManager.getSessionFile() ||
+			entries.some(e => e.type === "custom" && e.customType === CLAIM_TYPE && (e.data as { nonce?: string })?.nonce === saved.nonce)) {
+			config = await readConfig();
+			await mkdir(TEMP_DIR, { recursive: true });
+			updateStatus(ctx);
+			ctx.ui.notify("No valid live Telegram reload handoff; disconnected. Any archived checkpoint remains private session data, not permission to replay it.", "info");
+			return;
+		}
+		reloadPending = true;
+		recoveryRequired = true;
+		try {
+			pi.appendEntry(CLAIM_TYPE, { nonce: saved.nonce });
+			config = await readConfig();
+			await mkdir(TEMP_DIR, { recursive: true });
+			if (saved.configDigest !== configDigest(config) || saved.cursor !== config.lastUpdateId) throw new Error("config mismatch");
+			queuedTelegramTurns = structuredClone(saved.turns);
+			restoredDisconnected = !saved.connected;
+			preserveQueuedTurnsAsHistory = saved.held;
+			stopGeneration = saved.stopGeneration;
+			if (saved.connected) {
+				if (!config.botToken) throw new Error("missing config");
+				// A successful real API round trip, not creation of a polling promise. This
+				// probe does not advance the cursor or acknowledge any newer server updates.
+				await callTelegram("deleteWebhook", { drop_pending_updates: false });
+				await callTelegram("getUpdates", { offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
+					limit: 1, timeout: 0, allowed_updates: ["message", "edited_message"] });
+			}
+			if (closed) return;
+			recoveryRequired = false;
+			reloadPending = false;
+			if (saved.connected) await startPolling(ctx);
+			if (closed) return;
+			ctx.ui.notify(saved.connected ? "Telegram handoff restored; API verified, polling started (future network failures remain possible)."
+				: "Telegram handoff restored; bridge remains disconnected.", "info");
+			drainTelegramQueue(ctx);
+		} catch {
+			if (closed) return;
+			ctx.ui.notify("Telegram handoff recovery required; disconnected and dispatch blocked. Original queue checkpoint retained in private session data. Preserve it and reconcile Telegram messages manually before ordinary reload/connect; no automatic replay or retry.", "error");
+		}
 	});
 
-	pi.on("session_shutdown", async (_event, _ctx) => {
+	pi.on("session_shutdown", async (event, _ctx) => {
+		if (checkpoint) {
+			const permit = reloadState.permits.get(checkpoint.nonce);
+			if (permit) permit.armed = event.reason === "reload";
+		}
 		closed = true;
 		sessionController.abort();
 		if (drainTimer) clearImmediate(drainTimer);
@@ -1327,10 +1559,12 @@ export default function (pi: ExtensionAPI) {
 			await sendQueuedAttachments(turn);
 
 		} catch (error) {
+			uncertainReply = turn;
 			replyError = `reply failed: ${String(error)}`;
 		} finally {
 			await clearPreview(turn.chatId);
 			finalizingReply = false;
+			for (const resolve of replyWaiters.splice(0)) resolve();
 			updateStatus(ctx, replyError);
 			drainTelegramQueue(ctx);
 		}
