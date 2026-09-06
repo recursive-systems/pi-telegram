@@ -392,8 +392,10 @@ test('recovery-required early return cannot release restored work or restart pol
   h.reloadHook = async phase => { if (phase === 'after') h.networkGate = async method => { if (method === 'getUpdates') throw new Error('fake offline'); }; };
   const reload = h.command('telegram-reload'); await h.end(); await h.settle(); await reload;
   const requests = h.network.length;
+  await h.command('telegram-disconnect'); await h.command('telegram-connect');
   await h.command('telegram-reload'); await h.settle(); await ticks();
   assert.equal((await h.diagnostic()).recoveryRequired, true);
+  assert.equal((await h.reloadTool()).details.outcome, "refused");
   assert.equal(h.generation, 2); assert.equal(snapshots(h).length, 1);
   assert.equal(h.sent.length, 0); assert.equal(h.network.length, requests);
 });

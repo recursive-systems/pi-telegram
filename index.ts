@@ -11,6 +11,8 @@ import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
+import { telegramCommands, parseTelegramCommand, telegramHelp } from "./telegram-commands.ts";
+
 import { markdownToTelegramHtml } from "./markdown-to-telegram.ts";
 
 interface TelegramConfig {
@@ -92,6 +94,8 @@ interface TelegramFileInfo {
 }
 
 interface TelegramMessage {
+	business_connection_id?: string;
+	guest_query_id?: string;
 	message_id: number;
 	chat: TelegramChat;
 	from?: TelegramUser;
@@ -343,6 +347,11 @@ async function writeConfig(config: TelegramConfig): Promise<void> {
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
 	let reloadPending = false;
+	let connectionIntent = 0;
+	let reservation: symbol | undefined;
+	let verifiedUsername: string | undefined;
+	let verifiedToken: string | undefined;
+	let identityController: AbortController | undefined;
 	let reloadRunning = false;
 	let checkpoint: ReloadCheckpoint | undefined;
 	let restoreStarted = false;
@@ -352,6 +361,9 @@ export default function (pi: ExtensionAPI) {
 	const failedPreparations: TelegramMessage[][] = [];
 	const failedIngress: TelegramUpdate[] = [];
 	const replyWaiters: Array<() => void> = [];
+	let menuAttempted = false;
+	let menuState = "not-attempted";
+	let menuController: AbortController | undefined;
 	let pollingController: AbortController | undefined;
 	let pollingPromise: Promise<void> | undefined;
 	let queuedTelegramTurns: PendingTelegramTurn[] = [];
@@ -416,7 +428,7 @@ export default function (pi: ExtensionAPI) {
 			state.submitted ? "submitted" : state.active ? "active-awaiting-settlement" :
 			state.finalizing ? "finalizing" : !hostIdle ? "host-busy" : hostPending ? "host-pending" :
 			queuedTelegramTurns.length ? "awaiting-drain" : state.preparing ? "preparing" : "none";
-		return { instance, loadedAt, closed, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
+		return { instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
 			queued: queuedTelegramTurns.length, ...state, preparationCount,
 			reloadPending, recoveryRequired, restoredDisconnected, uncertainReply: !!uncertainReply,
 			failedPreparations: failedPreparations.length, failedIngress: failedIngress.length,
@@ -498,6 +510,43 @@ export default function (pi: ExtensionAPI) {
 			throw new Error(data.description || `Telegram API ${method} failed`);
 		}
 		return data.result;
+	}
+
+	// Optional UI operations never join ingress/preparation/finalization barriers.
+	// Race cancellation as well as passing a signal: even an uncooperative transport
+	// cannot strand polling or retain a live-context callback indefinitely.
+	async function boundedUiCall(method: string, body: Record<string, unknown>, signal = sessionController.signal, accept?: (result: unknown) => void): Promise<boolean> {
+		const controller = new AbortController();
+		const combined = AbortSignal.any([signal, sessionController.signal, controller.signal]);
+		let cancelled!: () => void;
+		const cancellation = new Promise<never>((_resolve, reject) => {
+			cancelled = () => reject(new Error("UI cancelled"));
+			combined.addEventListener("abort", cancelled, { once: true });
+			if (combined.aborted) cancelled();
+		});
+		const timer = setTimeout(() => controller.abort(), 2000);
+		timer.unref();
+		try {
+			const result = await Promise.race([callTelegram(method, body, { signal: combined }), cancellation]);
+			if (!combined.aborted) accept?.(result);
+			return !combined.aborted;
+		} catch { return false; }
+		finally { clearTimeout(timer); combined.removeEventListener("abort", cancelled); }
+	}
+
+	function syncCommandMenu(chatId: number, intent: number, signal: AbortSignal): void {
+		if (closed || reloadPending || signal.aborted || intent !== connectionIntent || menuAttempted || !pollingPromise || !Number.isSafeInteger(chatId)) return;
+		menuAttempted = true;
+		menuState = "pending";
+		const controller = menuController = new AbortController();
+		void boundedUiCall("setMyCommands", {
+			scope: { type: "chat", chat_id: chatId }, language_code: "",
+			commands: telegramCommands.map(({ command, description }) => ({ command, description })),
+		}, controller.signal).then(ok => {
+			if (closed || menuController !== controller || controller.signal.aborted) return;
+			menuState = ok ? "sent-best-effort" : "unavailable";
+			menuController = undefined;
+		});
 	}
 
 	async function callTelegramMultipart<TResponse>(
@@ -844,6 +893,10 @@ export default function (pi: ExtensionAPI) {
 
 			nextConfig.botId = data.result.id;
 			nextConfig.botUsername = data.result.username;
+			identityController?.abort();
+			identityController = undefined;
+			verifiedUsername = undefined;
+			verifiedToken = undefined;
 			config = nextConfig;
 			await writeConfig(config);
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
@@ -855,8 +908,19 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function stopPolling(): Promise<void> {
+	async function stopPolling(preserveAcceptedAddressing = false): Promise<void> {
+		identityController?.abort();
+		identityController = undefined;
+		// Internal handoff drains accepted ingress, including addressed /stop.
+		// Explicit disconnect/token changes still invalidate verified addressing.
+		if (!preserveAcceptedAddressing) {
+			verifiedUsername = undefined;
+			verifiedToken = undefined;
+		}
 		stopTypingLoop();
+		if (menuController) menuState = "cancelled";
+		menuController?.abort();
+		menuController = undefined;
 		pollingController?.abort();
 		pollingController = undefined;
 		await pollingPromise?.catch(() => undefined);
@@ -927,13 +991,48 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext): Promise<void> {
+	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext, intent: number): Promise<void> {
 		const firstMessage = messages[0];
 		if (closed || !firstMessage) return;
-		const rawText = messages.map((message) => (message.text || message.caption || "").trim()).find((text) => text.length > 0) || "";
-		const lower = rawText.toLowerCase();
+		const standalone = messages.length === 1 && typeof firstMessage.text === "string" &&
+			!firstMessage.caption && !firstMessage.media_group_id && !firstMessage.photo && !firstMessage.document &&
+			!firstMessage.video && !firstMessage.audio && !firstMessage.voice && !firstMessage.animation && !firstMessage.sticker;
+		const command = standalone ? parseTelegramCommand(firstMessage.text!, verifiedToken === config.botToken ? verifiedUsername : undefined) : undefined;
+		// Cursor acceptance survives disconnect for ordinary input, not controls.
+		// Handoff's internal poll abort does NOT change this explicit intent.
+		if (command && intent !== connectionIntent) return;
+		const reply = (text: string) => sendTextReply(firstMessage.chat.id, firstMessage.message_id, text);
+		if (command?.foreign) { await reply("Command addressed to another or unknown bot; not executed."); return; }
+		const route = command && telegramCommands.find(c => c.command === command.name);
+		if (command && !route) {
+			await reply(command.name === "reload" ? "Ordinary /reload is not supported remotely. Use /telegram_reload for a safe handoff."
+				: "Unknown or unavailable Telegram command; not executed or sent to pi. Use /commands.");
+			return;
+		}
+		if (route && command && ((route.args === "" && command.args) ||
+			(route.command === "bridge_status" && command.args !== "" && command.args !== "detail"))) {
+			await reply(`Usage: /${route.command}${route.args ? ` ${route.args}` : ""}`); return;
+		}
+		const lower = route ? `/${route.command}` : "";
+		if (lower === "/bridge_status") {
+			const snapshot = diagnostics(ctx);
+			const { lifecycle, ...summary } = snapshot;
+			await reply(`Bridge state (not model usage; sampled without a model turn):\n${JSON.stringify(command?.args === "detail" ? snapshot : summary, null, 2)}`);
+			return;
+		}
+		if (lower === "/telegram_reload") {
+			const request = reserveReload();
+			await boundedUiCall("sendMessage", { chat_id: firstMessage.chat.id, text: requestText(request.outcome) });
+			if (request.owner) {
+				const outcome = submitReload(ctx, request.owner);
+				if (outcome === "refused" && !closed) await boundedUiCall("sendMessage", {
+					chat_id: firstMessage.chat.id, text: requestText(outcome),
+				});
+			}
+			return; // NEVER await command completion: it awaits this polling ingress.
+		}
 
-		if (lower === "stop" || lower === "/stop") {
+		if (lower === "/stop") {
 			preserveQueuedTurnsAsHistory = true;
 			transition("stop-held");
 			stopGeneration++;
@@ -949,6 +1048,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (lower === "/version") {
 			const version = await getExtensionVersion();
+			if (closed || intent !== connectionIntent) return;
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, `pi-telegram extension @ ${version}`);
 			return;
 		}
@@ -959,16 +1059,16 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			ctx.compact({
+				customInstructions: command?.args || undefined,
 				onComplete: () => {
 					if (closed) return;
 					drainTelegramQueue(ctx);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.").catch((error) => updateStatus(ctx, String(error)));
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction completed.").catch(() => { if (!closed) updateStatus(ctx, "Telegram compaction notification unavailable"); });
 				},
-				onError: (error) => {
-					const message = error instanceof Error ? error.message : String(error);
+				onError: () => {
 					if (closed) return;
 					drainTelegramQueue(ctx);
-					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, `Compaction failed: ${message}`).catch((error) => updateStatus(ctx, String(error)));
+					void sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction failed; inspect Pi locally.").catch(() => { if (!closed) updateStatus(ctx, "Telegram compaction notification unavailable"); });
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
@@ -1022,17 +1122,14 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		if (lower === "/help" || lower === "/start") {
+		if (lower === "/help" || lower === "/start" || lower === "/commands") {
+			let discovered: unknown;
+			try { discovered = pi.getCommands(); } catch { /* optional catalog */ }
 			await sendTextReply(
 				firstMessage.chat.id,
 				firstMessage.message_id,
-				`Send me a message and I will forward it to pi. Commands: /status, /compact, stop.`,
+				telegramHelp(discovered),
 			);
-			if (config.allowedUserId === undefined && firstMessage.from) {
-				config.allowedUserId = firstMessage.from.id;
-				await writeConfig(config);
-				updateStatus(ctx);
-			}
 			return;
 		}
 
@@ -1113,7 +1210,7 @@ export default function (pi: ExtensionAPI) {
 		}
 	}
 
-	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext): Promise<void> {
+	async function handleAuthorizedTelegramMessage(message: TelegramMessage, ctx: ExtensionContext, intent: number): Promise<void> {
 		if (message.media_group_id) {
 			const key = `${message.chat.id}:${message.media_group_id}`;
 			let existing = mediaGroups.get(key);
@@ -1134,12 +1231,12 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await dispatchAuthorizedTelegramMessages([message], ctx);
+		await dispatchAuthorizedTelegramMessages([message], ctx, intent);
 	}
 
-	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext): Promise<void> {
+	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext, intent: number, signal: AbortSignal): Promise<void> {
 		const message = update.message || update.edited_message;
-		if (!message || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
+		if (!message || message.business_connection_id || message.guest_query_id || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
 
 		if (config.allowedUserId === undefined) {
 			config.allowedUserId = message.from.id;
@@ -1153,10 +1250,11 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
-		await handleAuthorizedTelegramMessage(message, ctx);
+		syncCommandMenu(message.chat.id, intent, signal);
+		await handleAuthorizedTelegramMessage(message, ctx, intent);
 	}
 
-	async function pollLoop(ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
+	async function pollLoop(ctx: ExtensionContext, signal: AbortSignal, intent: number): Promise<void> {
 		if (!config.botToken) return;
 
 		try {
@@ -1193,7 +1291,7 @@ export default function (pi: ExtensionAPI) {
 					try {
 						config.lastUpdateId = update.update_id;
 						await writeConfig(config);
-						await handleUpdate(update, ctx);
+						await handleUpdate(update, ctx, intent, signal);
 					} catch (error) {
 						failedIngress.push(update);
 						throw error;
@@ -1216,9 +1314,22 @@ export default function (pi: ExtensionAPI) {
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (closed || reloadPending || !config.botToken || pollingPromise) return;
+		// A failed, quiesced handoff may retain identity for its drained ingress.
+		// Starting another connection always requires a fresh verification.
+		verifiedUsername = undefined;
+		verifiedToken = undefined;
 		restoredDisconnected = false;
+		menuAttempted = false;
+		menuState = "not-attempted";
 		pollingController = new AbortController();
-		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
+		const identity = identityController = new AbortController();
+		const token = config.botToken;
+		void boundedUiCall("getMe", {}, identity.signal, result => {
+			if (closed || identityController !== identity || token !== config.botToken) return;
+			const username = (result as { username?: unknown })?.username;
+			if (typeof username === "string" && /^[a-zA-Z0-9_]+$/.test(username)) { verifiedUsername = username; verifiedToken = token; }
+		});
+		pollingPromise = pollLoop(ctx, pollingController.signal, connectionIntent).finally(() => {
 			pollingPromise = undefined;
 			pollingController = undefined;
 			updateStatus(ctx);
@@ -1250,12 +1361,15 @@ export default function (pi: ExtensionAPI) {
 			if (closed || reloadRunning || recoveryRequired) return;
 			reloadPending = true;
 			reloadRunning = true;
+			reservation = undefined;
+			const intent = connectionIntent;
 			let stopped = false;
 			try {
 				if (refuseReload(ctx)) { releaseUnstartedReload(ctx); return; }
 				await ctx.waitForIdle();
 				if (finalizingReply) await new Promise<void>(resolve => replyWaiters.push(resolve));
 				if (closed) return;
+				if (intent !== connectionIntent) throw new Error("connection intent changed");
 				if (refuseReload(ctx) || activeTelegramTurn || !ctx.isIdle() || ctx.hasPendingMessages())
 					throw new Error("not safe");
 				const connected = !!pollingPromise;
@@ -1267,6 +1381,7 @@ export default function (pi: ExtensionAPI) {
 				// anything. Don't promise file-based recovery for an in-memory-only log.
 				const persisted = await stat(sessionFile).then(info => info.isFile(), () => false);
 				if (closed) return;
+				if (intent !== connectionIntent) throw new Error("connection intent changed");
 				if (!persisted) {
 					releaseUnstartedReload(ctx);
 					ctx.ui.notify("Telegram reload refused: session file is not persisted yet. Let Pi save an assistant response before retrying; queued work remains in this instance.", "error");
@@ -1277,7 +1392,7 @@ export default function (pi: ExtensionAPI) {
 				// If handoff fails after quiescing, unrelated idle events must not
 				// silently run a disconnected queue. Explicit connect releases it.
 				restoredDisconnected = true;
-				await stopPolling();
+				await stopPolling(true);
 				for (const state of mediaGroups.values()) {
 					if (state.flushTimer) clearTimeout(state.flushTimer);
 					state.ready();
@@ -1285,11 +1400,13 @@ export default function (pi: ExtensionAPI) {
 				mediaGroups.clear();
 				await preparingTurns;
 				if (closed) return;
+				if (intent !== connectionIntent) throw new Error("connection intent changed");
 				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
 					throw new Error("not safe after quiescing");
 				const diskConfig = await readConfig();
 				if (configDigest(diskConfig) !== configDigest(config) || diskConfig.lastUpdateId !== config.lastUpdateId) throw new Error("config changed");
 				if (closed) return;
+				if (intent !== connectionIntent) throw new Error("connection intent changed");
 				// No async work between this final admission check and snapshot/reload.
 				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
 					throw new Error("not safe after config verification");
@@ -1340,19 +1457,56 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	// Catalog and dispatch are separate host operations. Refuse ambiguity, including
+	// duplicate namespaces; never infer ownership from a description or name alone.
+	function reloadCallable(): boolean {
+		try {
+			const commands = pi.getCommands();
+			const candidates = commands.filter(c => c.name === "telegram-reload" || c.name.startsWith("telegram-reload:"));
+			return candidates.length === 1 && candidates[0].name === "telegram-reload" &&
+				candidates[0].source === "extension" && candidates[0].sourceInfo?.path === fileURLToPath(new URL("./index.ts", import.meta.url));
+		} catch { return false; }
+	}
+	type RequestOutcome = "requested" | "coalesced" | "refused";
+	function requestText(outcome: RequestOutcome): string {
+		return outcome === "requested"
+			? "Requested /telegram-reload submission; completion, if admitted, is reported locally. This is not an admission or reconnection acknowledgement."
+			: outcome === "coalesced" ? "Reload already pending; coalesced without another submission. Admission and completion remain unknown."
+			: "Reload request refused or cancelled; nothing submitted. Check bridge recovery/connection state and command collisions locally; use local /telegram-reload only after resolving them.";
+	}
+	function reserveReload(): { outcome: RequestOutcome; owner?: symbol } {
+		if (closed || recoveryRequired || !reloadCallable()) return { outcome: "refused" };
+		if (reloadPending || reloadRunning) return { outcome: "coalesced" };
+		reloadPending = true;
+		reservation = Symbol();
+		return { outcome: "requested", owner: reservation };
+	}
+	function submitReload(ctx: ExtensionContext, owner: symbol): RequestOutcome {
+		if (reservation !== owner) return "refused";
+		if (closed || recoveryRequired || !reloadCallable()) {
+			reservation = undefined;
+			if (!closed) releaseUnstartedReload(ctx);
+			return "refused";
+		}
+		reservation = undefined;
+		try {
+			pi.sendUserMessage("/telegram-reload", { deliverAs: "followUp", expandPromptTemplates: true });
+			return "requested";
+		} catch {
+			if (!closed && !reloadRunning) releaseUnstartedReload(ctx);
+			return "refused";
+		}
+	}
+
 	pi.registerTool({
 		name: "telegram_reload",
 		label: "Telegram Reload",
 		description: "Schedule /telegram-reload safely after the current turn and Telegram reply. ONLY call with explicit user authorization to reload this runtime. Never reload autonomously. Does not install or upgrade source.",
 		parameters: Type.Object({}),
-		async execute() {
-			if (!reloadPending && !closed) {
-				reloadPending = true;
-				// Command dispatch precedes streaming checks. Do not await it from the tool:
-				// the command itself waits for host idle, including this tool's final turn.
-				pi.sendUserMessage("/telegram-reload", { deliverAs: "followUp", expandPromptTemplates: true });
-			}
-			return { content: [{ type: "text", text: "Requested /telegram-reload; completion is reported locally. This is not an admission or reconnection acknowledgement." }], details: {} };
+		async execute(_id, _params, _signal, _onUpdate, ctx) {
+			const request = reserveReload();
+			const outcome = request.owner ? submitReload(ctx, request.owner) : request.outcome;
+			return { content: [{ type: "text", text: requestText(outcome) }], details: { outcome } };
 		},
 	});
 
@@ -1438,6 +1592,9 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-disconnect", {
 		description: "Stop the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
+			connectionIntent++;
+			restoredDisconnected = true;
+			if (reservation) { reservation = undefined; releaseUnstartedReload(ctx); }
 			await stopPolling();
 			updateStatus(ctx);
 		},
@@ -1521,6 +1678,8 @@ export default function (pi: ExtensionAPI) {
 			if (permit) permit.armed = event.reason === "reload";
 		}
 		closed = true;
+		menuController?.abort();
+		menuController = undefined;
 		settlementOwed = false;
 		transition("shutdown");
 		sessionController.abort();

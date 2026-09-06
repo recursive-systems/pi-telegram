@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { appendFileSync } from 'node:fs';
+import fsPromises from 'node:fs/promises';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
@@ -18,15 +20,26 @@ export async function harness(t, options = {}) {
   const oldHome = process.env.HOME;
   process.env.HOME = home;
   await mkdir(join(home, '.pi/agent'), { recursive: true });
-  await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0 }));
+  await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0, ...options.config }));
+  let configWrite = async () => {}, pollSignal;
+  const originalWriteFile = fsPromises.writeFile;
+  const writeMock = t.mock.method(fsPromises, 'writeFile', async (path, ...args) => {
+    if (path === join(home, '.pi/agent/telegram.json')) await configWrite(JSON.parse(args[0]));
+    return originalWriteFile(path, ...args);
+  });
+  syncBuiltinESMExports();
+  t.after(() => { writeMock.mock.restore(); syncBuiltinESMExports(); });
   let handlers, commands, tools, ctx, invalidate, flagValues, registrations, factoryTools, factoryFlag;
   let restoredFlags;
+  const compactions = [];
+  const identityUsername = options.identity ?? options.config?.botUsername;
+  let discovered = options.discovered ?? [], commandSubmission = options.commandSubmission;
   const sent = [], network = [], statuses = [], errors = [], notices = [], entries = [], submissions = [], lifecycle = [], serverUpdates = [];
   let generation = 0, activePolls = 0, maxPolls = 0, idleWaiter = deferred(), reloadHook = async () => {}, appendHook = () => {};
   let sessionId = 'fake-session', sessionFile = join(home, 'session.jsonl');
   // Real Pi may name a fresh session before it has ever flushed a JSONL file.
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
-  let reloadMode = 'normal';
+  let reloadMode = 'normal', sessionFileRead = () => {};
   let idle = true, compacting = false, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
   const emit = async (name, event = {}) => handlers.get(name)?.({ type: name, ...event }, ctx);
   async function instantiate(omitExtension = false) {
@@ -36,11 +49,13 @@ export async function harness(t, options = {}) {
     const check = () => assert.ok(valid, 'stale host API used');
     invalidate = () => { valid = false; };
     const ownCtx = ctx = {
+      getContextUsage: () => { check(); return undefined; },
+      compact: opts => { check(); compactions.push(opts); },
       isIdle: () => { check(); return idle && !compacting; }, hasPendingMessages: () => { check(); return pending; },
       abort: () => { check(); h.aborts++; },
       waitForIdle: async () => { check(); if (!idle || compacting) await idleWaiter.promise; },
       sessionManager: { getEntries: () => { check(); return entries; }, getSessionId: () => { check(); return sessionId; },
-        getSessionFile: () => { check(); return sessionFile; } },
+        getSessionFile: () => { check(); sessionFileRead(); return sessionFile; } },
       ui: { theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
         notify: (text, level) => { check(); notices.push({ text, level }); } },
       reload: async () => {
@@ -69,6 +84,7 @@ export async function harness(t, options = {}) {
     const extension = (await import(`../index.ts?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
     extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, command) => commands.set(name, command),
       registerFlag: (name, options) => { if (!flagValues.has(name)) flagValues.set(name, options.default); },
+      getCommands: () => { check(); if (options.catalogThrows) throw new Error('SECRET'); return [...(options.reloadCatalog ?? [{ name: 'telegram-reload', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } }]), ...discovered]; },
       getFlag: name => { check(); return flagValues.get(name); },
       registerTool: tool => { check(); registrations.push(tool.name); tools.set(tool.name, tool); },
       appendEntry: (customType, data) => {
@@ -82,8 +98,10 @@ export async function harness(t, options = {}) {
         // Faithful Pi: command dispatch is BEFORE streaming checks, and the API
         // catches async errors and returns void, never command completion.
         if (opts?.expandPromptTemplates && typeof content === 'string' && content.startsWith('/')) {
-          void ownCommands.get(content.slice(1)).handler('', ownCtx).catch(error => errors.push(error));
-          return;
+          if (commandSubmission === 'throw') throw new Error('fake synchronous submission failure');
+          if (commandSubmission === 'swallow') return;
+          const command = options.reloadCatalog ? undefined : ownCommands.get(content.slice(1));
+          if (command) { void command.handler('', ownCtx).catch(error => errors.push(error)); return; }
         }
         sent.push(content); onSend(content);
       },
@@ -111,6 +129,7 @@ export async function harness(t, options = {}) {
       return { json: async () => { activePolls--; return { ok: true, result: serverUpdates.filter(u => u.update_id >= (body.offset ?? 0)).slice(0, body.limit) }; } };
     }
     if (method === 'getUpdates') {
+      pollSignal = options.signal;
       activePolls++; maxPolls = Math.max(maxPolls, activePolls);
       const request = deferred(); poll = request;
       const available = serverUpdates.filter(u => u.update_id >= (body.offset ?? 0)).slice(0, body.limit);
@@ -119,10 +138,12 @@ export async function harness(t, options = {}) {
       return { json: async () => { try { return { ok: true, result: await request.promise }; } finally { activePolls--; if (poll === request) poll = undefined; } } };
     }
     if (networkGate) await networkGate(method, body, options.signal);
-    return { json: async () => ({ ok: true, result: method === 'getFile' ? { file_path: 'fake.txt' } : { message_id: network.length } }) };
+    return { json: async () => ({ ok: true, result: method === 'getMe' ? { username: identityUsername } : method === 'getFile' ? { file_path: 'fake.txt' } : { message_id: network.length } }) };
   });
   const h = {
-    home, sent, network, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    home, sent, network, compactions, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    set configWrite(value) { configWrite = value; },
+    set discovered(value) { discovered = value; }, set commandSubmission(value) { commandSubmission = value; },
     get handlers() { return handlers; },
     get factoryFlag() { return factoryFlag; }, get factoryTools() { return factoryTools; },
     get registrations() { return registrations; }, get tools() { return tools; }, get ctx() { return ctx; },
@@ -132,12 +153,15 @@ export async function harness(t, options = {}) {
       const id = ++updateId;
       serverUpdates.push({ update_id: id, message: { message_id: id, chat: { id: 70, type: 'private' }, from: { id: 7 }, text, ...extra } });
     },
+    push(text, extra = {}) { const request = poll; poll = undefined; const id = ++updateId; request.resolve([{ update_id: id, message: { message_id: id, chat: { id: 70, type: "private" }, from: { id: 7 }, text, ...extra } }]); },
+    get pollAborted() { return pollSignal?.aborted; },
     get generation() { return generation; }, get maxPolls() { return maxPolls; }, get polling() { return !!poll; },
     set reloadHook(value) { reloadHook = value; }, set appendHook(value) { appendHook = value; },
     set reloadMode(value) { reloadMode = value; },
+    set sessionFileRead(value) { sessionFileRead = value; },
     set sessionId(value) { sessionId = value; }, set sessionFile(value) { sessionFile = value; },
     command: (name, args = '') => commands.get(name).handler(args, ctx),
-    reloadTool: () => tools.get('telegram_reload').execute('call', {}),
+    reloadTool: () => tools.get('telegram_reload').execute('call', {}, undefined, undefined, ctx),
     async replace(reason) {
       await emit('session_shutdown', { reason }); invalidate(); restoredFlags = new Map(flagValues); await instantiate(); await emit('session_start', { reason });
     },

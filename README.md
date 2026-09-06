@@ -118,6 +118,58 @@ Chat with your bot in Telegram DMs.
 
 Send any message in the bot DM. It is forwarded into pi with a `[telegram]` prefix.
 
+### Telegram commands and menu
+
+Send `/commands`, `/help`, or `/start` for help. Implemented remote routes:
+
+| Command | Response/action |
+| --- | --- |
+| `/status` | Model and token usage |
+| `/bridge_status [detail]` | Content-free bridge diagnostics sampled directly, **without a model turn** |
+| `/version` | Lazy cached checkout version, not loaded-code attestation |
+| `/compact [instructions]` | Compact only while Pi is idle; optional instruction text preserves case |
+| `/stop` or bare `stop` | Abort and hold queued history |
+| `/telegram_reload` | Request the existing safe runtime handoff, not install/upgrade source |
+| `/commands`, `/help`, `/start` | Help and a bounded local-only Pi catalog |
+
+Only standalone text is interpreted as a command. Captions, albums and messages
+with attachments stay normal model input and preserve files/FIFO. Command names
+and `@bot` suffixes are case-insensitive; argument text is not lowercased. An
+addressed command is refused until a bounded (2s), once-per-connection `getMe` verifies the active token username, or if its suffix differs. Configuration is not identity. Explicit disconnect/shutdown invalidates this cache and cancels delayed verification; bare commands do not wait for it. Internal handoff preserves already-verified addressing while accepted ingress drains, so an accepted `/stop@Own_Bot` still holds queued history. A new connection always verifies afresh, including after a failed handoff. Failed verification is not polled again until reconnect.
+Unsupported arguments return usage. **Intentional compatibility change:** unknown
+or unavailable standalone slash commands are explicitly rejected, not silently
+sent to the model. Telegram `/reload` points to `/telegram_reload`; it never runs
+ordinary teardown. These control/help responses do not release stop-held history.
+
+`pi.getCommands()` is sampled dynamically for help: up to 12 validated names
+from the first 200 entries (extension, prompt, skill), with visible filtering /
+truncation. Names retain hyphens/colons; no aliases are invented. Metadata paths
+and descriptions are omitted. These entries are **local-only, not remotely
+executable**; discovery does not include Pi's interactive built-ins and grants no
+permission to execute extensions, skills, templates, pickers, shell, or login.
+
+On the first authorized ordinary private message of each connection, the bridge
+best-effort publishes just the implemented routes with `setMyCommands`, scoped to
+that observed chat (not the sender ID, global/default, or all-private scope).
+No startup menu API calls occur while disconnected. Alternate business/guest
+message contexts are not accepted as ordinary bot DMs. Existing pairing policy
+is unchanged. Menu metadata is never authorization.
+
+Registration has a two-second deadline, no retry loop and no per-message repeat;
+disconnect/shutdown cancels pending work. Diagnostics report `menuState` using
+fixed labels. Failure cannot block ingress, finalization, or handoff; `/commands`
+still works. A successful request does not prove the client has refreshed its menu.
+Existing language-specific lists or custom menu buttons may take precedence; v1
+does not overwrite those settings. Server-side menu changes are not transactional
+with reload, and a stale visible command never grants execution permission.
+
+The reload alias blocks new queue dispatch before its bounded **requested** receipt,
+then submits the authorized local command and releases polling ingress immediately.
+The receipt is not proof of admission, completion, or reconnection. Final replies,
+files, and all existing handoff refusal gates still apply. Synchronous submission
+failure clears the new reservation; swallowed asynchronous failure leaves dispatch
+held for explicit local `/telegram-reload` retry, never automatic resend.
+
 ### Send images and files
 
 Send images, albums, or files in the DM.
@@ -250,7 +302,8 @@ On Pi **0.85.0**, `/telegram-reload` reloads the **installed runtime**, preservi
 this bridge's prepared FIFO queue and `stop` hold/history. It does **not** install
 new source, upgrade Pi, or change package pins. The `telegram_reload` tool is a
 thin command scheduler: the model must have **explicit user authorization** to
-call it. There is no Telegram command alias or general auto-connect option.
+call it. The paired Telegram `/telegram_reload` alias schedules the same handoff
+without asking a model to translate it. There is no general auto-connect option.
 
 The command blocks new queue dispatch immediately, waits for host idle **and**
 the current Telegram final reply/attachments, stops and awaits its old poller
@@ -383,3 +436,43 @@ perform an ordinary `/reload`. Verify version/status and explicitly connect only
 intended owner. The older version does not restore these checkpoints; save and
 reconcile any pending work before rollback. Installing or reverting a pin and
 reloading the running runtime are distinct operations.
+
+
+### Revised control boundaries and owner acceptance
+
+Remote reload reserves its queue hold before the bounded receipt. Receipts describe
+requested submission, coalescing, or refusal—not admission or reconnection. A
+synchronous rejection cancels only that reservation; asynchronous interception
+remains unknown and is never blindly retried. Both tool and remote scheduler check
+the command catalog immediately before submission: exactly one bare bridge command
+with this extension's `SourceInfo.path` is required. Missing/throwing catalogs,
+foreign provenance, duplicates/namespaced collisions, and conflicting templates
+are conservatively refused with a local-resolution hint (no paths sent to Telegram).
+Pi dispatches extension commands before template/model processing; a missing command
+can fall through, so catalog discovery alone is not authority. There is no atomic
+host catalog-and-dispatch API: synchronous registry mutation/interception by other
+extensions remains a host limit, not an acknowledgement or global prompt lock.
+
+Explicit `/telegram-disconnect` cancels unsubmitted reservations and invalidates an
+in-progress handoff at every existing pre-checkpoint await, including the persisted
+session-file check. Accepted ingress carries its originating connection intent across
+cursor/pairing writes: stale controls cannot reserve reload, compact, stop, or become
+model input, and cancelled ingress cannot restart optional menu work.
+
+Disconnect also pauses queued dispatch **in this instance**, not just new polling.
+In-progress preparation and the current reply can finish; accepted ordinary text,
+files, and albums remain queued in FIFO order, **only in memory**. Explicit
+`/telegram-connect` wakes eligible queued work once without clearing stop-history,
+uncertain-admission, or recovery holds. This is not durability across an ordinary
+restart. The handoff's
+internal poller stop is not cancellation. The supported cancellation boundary is
+before checkpoint/teardown; after the terminal reload call, host lifecycle owns the
+operation. Optional menu and identity tasks remain outside handoff barriers.
+
+After independent offline review, owner-only live checks: verify stale configured
+username cannot control a different token's bot, then verify case-insensitive own
+suffix and bare help/status/stop; check compact completion/failure; disconnect while
+a reload receipt is delayed and confirm no reconnect; test a duplicate command
+collision is refused; finally test authorized reload with queued files/FIFO and
+one poller. Check the private menu in the client (API success is not cache refresh).
+No live acceptance or publication readiness is claimed by the offline suite.
