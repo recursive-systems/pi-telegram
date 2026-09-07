@@ -15,6 +15,8 @@ import { telegramCommands, parseTelegramCommand, telegramHelp } from "./telegram
 
 import { markdownToTelegramHtml } from "./markdown-to-telegram.ts";
 
+import { ORIGIN_CAPTURE, ORIGIN_CLAIM, ORIGIN_READY, validOrigin, validEpoch, type JobOrigin, type OriginCapture, type OriginClaim } from "./job-origin.ts";
+
 interface TelegramConfig {
 	botToken?: string;
 	botUsername?: string;
@@ -133,6 +135,7 @@ interface DownloadedTelegramFile {
 }
 
 interface PendingTelegramTurn {
+	origin?: JobOrigin;
 	marker: string;
 	chatId: number;
 	replyToMessageId: number;
@@ -149,6 +152,7 @@ interface QueuedAttachment {
 }
 
 interface TelegramPreviewState {
+	replyToMessageId?: number;
 	mode: "draft" | "message";
 	draftId?: number;
 	messageId?: number;
@@ -167,6 +171,7 @@ interface TelegramMediaGroupState {
 // Only a live, one-shot capability can authorize restoration. Session entries alone
 // (including copied/forked entries) never authorize a connection. No credentials here.
 interface ReloadCheckpoint {
+	bridgeEpoch?: string;
 	version: 1;
 	reason: "telegram-reload";
 	nonce: string;
@@ -346,6 +351,9 @@ async function writeConfig(config: TelegramConfig): Promise<void> {
 
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
+	let bridgeEpoch: string = randomUUID();
+	let originCtx: ExtensionContext | undefined;
+	let originSubscriptions: Array<() => void> = [];
 	let reloadPending = false;
 	let connectionIntent = 0;
 	let reservation: symbol | undefined;
@@ -692,10 +700,10 @@ export default function (pi: ExtensionAPI) {
 		if (state.messageId === undefined) {
 			const html = markdownToTelegramHtml(truncated);
 			try {
-				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML" });
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: html, parse_mode: "HTML", ...replyParameters(state.replyToMessageId) });
 				state.messageId = sent.message_id;
 			} catch {
-				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated, ...replyParameters(state.replyToMessageId) });
 				state.messageId = sent.message_id;
 			}
 			state.mode = "message";
@@ -728,7 +736,7 @@ export default function (pi: ExtensionAPI) {
 			return false;
 		}
 		if (state.mode === "draft") {
-			await sendFormattedText(chatId, finalText);
+			await sendFormattedText(chatId, finalText, state.replyToMessageId);
 			await clearPreview(chatId);
 			return true;
 		}
@@ -737,23 +745,30 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	/** Send `text` preferring formatted HTML, falling back to plain text on rejection. */
-	async function sendFormattedText(chatId: number, text: string): Promise<number | undefined> {
+	async function sendFormattedText(chatId: number, text: string, replyToMessageId?: number): Promise<number | undefined> {
 		try {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: markdownToTelegramHtml(text), parse_mode: "HTML" });
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: markdownToTelegramHtml(text), parse_mode: "HTML", ...replyParameters(replyToMessageId) });
 			return sent.message_id;
 		} catch {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text });
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text, ...replyParameters(replyToMessageId) });
 			return sent.message_id;
 		}
 	}
 
-	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
+	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string, threaded = false): Promise<number | undefined> {
 		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			lastMessageId = await sendFormattedText(chatId, chunk);
+			lastMessageId = await sendFormattedText(chatId, chunk, threaded ? _replyToMessageId : undefined);
 		}
 		return lastMessageId;
+	}
+
+	function continuationReplyTo(turn: PendingTelegramTurn | undefined): number | undefined {
+		return turn?.origin && turn.origin.requestMarker !== turn.marker ? turn.replyToMessageId : undefined;
+	}
+	function replyParameters(messageId?: number) {
+		return messageId === undefined ? {} : { reply_parameters: { message_id: messageId } };
 	}
 
 	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
@@ -766,6 +781,7 @@ export default function (pi: ExtensionAPI) {
 					method,
 					{
 						chat_id: String(turn.chatId),
+						...(continuationReplyTo(turn) === undefined ? {} : { reply_parameters: JSON.stringify({ message_id: turn.replyToMessageId }) }),
 					},
 					fieldName,
 					attachment.path,
@@ -774,7 +790,7 @@ export default function (pi: ExtensionAPI) {
 			} catch (error) {
 				uncertainReply = turn;
 				const message = error instanceof Error ? error.message : String(error);
-				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`);
+				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`, continuationReplyTo(turn) !== undefined);
 			}
 		}
 	}
@@ -905,6 +921,7 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 		} finally {
 			setupInProgress = false;
+			drainTelegramQueue(ctx);
 		}
 	}
 
@@ -1192,11 +1209,65 @@ export default function (pi: ExtensionAPI) {
 		compactionWakeTimer.unref();
 	}
 
+	function canSubmitTelegramTurn(ctx: ExtensionContext): boolean {
+		return !(closed || reloadPending || restoredDisconnected || failedPreparations.length || failedIngress.length || preflightPending || preserveQueuedTurnsAsHistory || submittedTelegramTurn || activeTelegramTurn || finalizingReply ||
+			!ctx.isIdle() || ctx.hasPendingMessages());
+	}
+
+	function originReady(ctx: ExtensionContext): boolean {
+		return canSubmitTelegramTurn(ctx) && !recoveryRequired && !setupInProgress && !uncertainReply &&
+			!!pollingPromise && !pollingController?.signal.aborted && !preparationCount && !mediaGroups.size &&
+			!settlementOwed && !queuedTelegramTurns.length;
+	}
+
+	// Bind reply fields against edited records using the existing process-local key.
+	// This is integrity checking, not isolation from another same-process extension.
+	function originSignature(origin: Omit<JobOrigin, "signature">): string {
+		return createHmac("sha256", reloadState.key).update(JSON.stringify([origin.provider, origin.version,
+			origin.sessionId, origin.requestMarker, origin.chatId, origin.replyToMessageId,
+			origin.configDigest, origin.bridgeEpoch, origin.stopGeneration])).digest("hex");
+	}
+
+	function subscribeOrigins(ctx: ExtensionContext): void {
+		originCtx = ctx;
+		if (originSubscriptions.length) return;
+		originSubscriptions.push(pi.events.on(ORIGIN_CAPTURE, (data: unknown) => {
+			const request = data as OriginCapture | undefined;
+			const origin = activeTelegramTurn?.origin;
+			if (!closed && routingTelegram && origin && validOrigin(origin) && request?.sessionId === origin.sessionId &&
+				typeof request.capture === "function") request.capture({ ...origin });
+		}), pi.events.on(ORIGIN_CLAIM, (data: unknown) => {
+			// This handler MUST remain synchronous. emit() is void; async work cannot claim.
+			const request = data as OriginClaim | undefined;
+			const ctx = originCtx;
+			if (!ctx || !request || typeof request.accept !== "function" || !validOrigin(request.origin) ||
+				typeof request.text !== "string" || request.text.length > 50_000 || !request.text.startsWith("[jobs] Completed background jobs:")) return;
+			const origin = request.origin;
+			if (!originReady(ctx) || origin.sessionId !== ctx.sessionManager.getSessionId() ||
+				origin.configDigest !== configDigest(config) || origin.bridgeEpoch !== bridgeEpoch || origin.stopGeneration !== stopGeneration || origin.signature !== originSignature(origin)) return;
+			const marker = `[turn:${randomUUID()}]`;
+			const text = `${TELEGRAM_PREFIX} ${marker} Background completion continuation for original request ${origin.requestMarker}.\n` +
+				"This is a background job result, not a fresh human instruction. Assess the result and continue/report to the original requester as appropriate.\n\n" + request.text;
+			const turn: PendingTelegramTurn = { marker, origin: { ...origin }, chatId: origin.chatId,
+				replyToMessageId: origin.replyToMessageId, queuedAttachments: [], content: [{ type: "text", text }], historyText: text };
+			queuedTelegramTurns.push(turn);
+			queuedAt.set(turn, Date.now());
+			submitNextTelegramTurn(ctx);
+			if (submittedTelegramTurn === turn || activeTelegramTurn === turn) request.accept();
+			else {
+				// Synchronous host rejection: producer still owns the pending notification.
+				queuedTelegramTurns = queuedTelegramTurns.filter(t => t !== turn);
+			}
+		}));
+	}
+
 	function submitNextTelegramTurn(ctx: ExtensionContext): void {
-		if (closed || reloadPending || restoredDisconnected || failedPreparations.length || failedIngress.length || preflightPending || preserveQueuedTurnsAsHistory || submittedTelegramTurn || activeTelegramTurn || finalizingReply ||
-			!ctx.isIdle() || ctx.hasPendingMessages()) return;
+		if (!canSubmitTelegramTurn(ctx)) return;
 		const turn = queuedTelegramTurns[0];
-		if (!turn) return;
+		if (!turn) {
+			if (originReady(ctx)) pi.events.emit(ORIGIN_READY, { provider: "telegram", version: 1 });
+			return;
+		}
 		submittedTelegramTurn = turn;
 		transition("submitted");
 		updateStatus(ctx);
@@ -1411,7 +1482,7 @@ export default function (pi: ExtensionAPI) {
 				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
 					throw new Error("not safe after config verification");
 				checkpoint = structuredClone({ version: 1, reason: "telegram-reload", nonce: randomUUID(), sessionId, sessionFile,
-					configDigest: configDigest(config), connected, cursor: config.lastUpdateId,
+					configDigest: configDigest(config), bridgeEpoch, connected, cursor: config.lastUpdateId,
 					held: preserveQueuedTurnsAsHistory, stopGeneration, turns: queuedTelegramTurns });
 				// Bound session growth; never silently truncate private text or image inputs.
 				if (Buffer.byteLength(JSON.stringify(checkpoint)) > 8 * 1024 * 1024) throw new Error("checkpoint too large");
@@ -1601,6 +1672,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (event, ctx) => {
+		subscribeOrigins(ctx);
 		// CLI/restored flags are applied after the factory, before session_start.
 		registerDiagnosticsTool();
 		transition("session-start");
@@ -1642,6 +1714,8 @@ export default function (pi: ExtensionAPI) {
 			config = await readConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			if (saved.configDigest !== configDigest(config) || saved.cursor !== config.lastUpdateId) throw new Error("config mismatch");
+			if (saved.bridgeEpoch !== undefined && !validEpoch(saved.bridgeEpoch)) throw new Error("invalid bridge epoch");
+			if (saved.bridgeEpoch !== undefined) bridgeEpoch = saved.bridgeEpoch;
 			queuedTelegramTurns = structuredClone(saved.turns);
 			// Diagnostic clocks restart in this instance, not at original arrival.
 			const restoredAt = Date.now();
@@ -1678,6 +1752,8 @@ export default function (pi: ExtensionAPI) {
 			if (permit) permit.armed = event.reason === "reload";
 		}
 		closed = true;
+		for (const unsubscribe of originSubscriptions.splice(0)) unsubscribe();
+		originCtx = undefined;
 		menuController?.abort();
 		menuController = undefined;
 		settlementOwed = false;
@@ -1713,9 +1789,15 @@ export default function (pi: ExtensionAPI) {
 			submittedTelegramTurn = undefined;
 			queuedTelegramTurns.splice(queuedTelegramTurns.indexOf(turn), 1);
 			activeTelegramTurn = turn;
+			if (!turn.origin) {
+				const origin = { provider: "telegram" as const, version: 1 as const, sessionId: ctx.sessionManager.getSessionId(),
+					requestMarker: turn.marker, chatId: turn.chatId, replyToMessageId: turn.replyToMessageId,
+					configDigest: configDigest(config), bridgeEpoch, stopGeneration };
+				turn.origin = { ...origin, signature: originSignature(origin) };
+			}
 			awaitingTelegramStart = true;
 			lastTelegramAssistant = {};
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			previewState = { replyToMessageId: continuationReplyTo(activeTelegramTurn), mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 			startTypingLoop(ctx);
 		}
 		transition("before-agent-start", ctx);
@@ -1746,13 +1828,13 @@ export default function (pi: ExtensionAPI) {
 			await finalizePreview(activeTelegramTurn.chatId);
 		}
 		if (closed || !routingTelegram || !activeTelegramTurn) return;
-		previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+		previewState = { replyToMessageId: continuationReplyTo(activeTelegramTurn), mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 	});
 
 	pi.on("message_update", async (event, _ctx) => {
 		if (closed || !routingTelegram || !activeTelegramTurn || !isAssistantMessage(event.message)) return;
 		if (!previewState) {
-			previewState = { mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
+			previewState = { replyToMessageId: continuationReplyTo(activeTelegramTurn), mode: draftSupport === "unsupported" ? "message" : "draft", pendingText: "", lastSentText: "" };
 		}
 		previewState.pendingText = getMessageText(event.message);
 		schedulePreviewFlush(activeTelegramTurn.chatId);
@@ -1812,7 +1894,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			if (assistant.stopReason === "error") {
 				await clearPreview(turn.chatId);
-				await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.");
+				await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.", continuationReplyTo(turn) !== undefined);
 				return;
 			}
 
@@ -1823,13 +1905,13 @@ export default function (pi: ExtensionAPI) {
 
 			if (finalText && finalText.length <= MAX_MESSAGE_LENGTH) {
 				const finalized = await finalizePreview(turn.chatId);
-				if (!finalized) await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+				if (!finalized) await sendTextReply(turn.chatId, turn.replyToMessageId, finalText, continuationReplyTo(turn) !== undefined);
 			} else {
 				await clearPreview(turn.chatId);
 				if (finalText) {
-					await sendTextReply(turn.chatId, turn.replyToMessageId, finalText);
+					await sendTextReply(turn.chatId, turn.replyToMessageId, finalText, continuationReplyTo(turn) !== undefined);
 				} else if (turn.queuedAttachments.length > 0) {
-					await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).");
+					await sendTextReply(turn.chatId, turn.replyToMessageId, "Attached requested file(s).", continuationReplyTo(turn) !== undefined);
 				}
 			}
 
