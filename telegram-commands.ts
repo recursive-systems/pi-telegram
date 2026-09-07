@@ -26,6 +26,7 @@ export function telegramHelp(discovered: unknown): string {
 	const lines = ["Telegram commands (implemented remotely):", ...telegramCommands.map(c => `/${c.command}${c.args ? ` ${c.args}` : ""} — ${c.description}`),
 		"Bare stop also works. Commands require standalone text; captions remain normal input.",
 		"Other slash commands are not executed or forwarded. /reload: use /telegram_reload.",
+		"/telegram-inbox is LOCAL ONLY: inspect/reconcile retained input; no remote acknowledge or replay.",
 		"Pi catalog — LOCAL ONLY, not supported remotely (no automatic aliases):"];
 	if (!Array.isArray(discovered)) return [...lines, "Catalog unavailable."].join("\n");
 	const seen = new Set<string>();

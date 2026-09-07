@@ -1,11 +1,5 @@
-// No installs or host SDK imports. Resolve Pi's public parser from the explicit
-// installed package while retaining this worktree's read-only legacy peers.
+// No installs, scanning other checkouts, or host SDK imports. Normal project
+// resolution by default; explicit installed-package overrides for bare worktrees.
 import { registerHooks } from 'node:module';
-import { pathToFileURL } from 'node:url';
-import { join } from 'node:path';
-import assert from 'node:assert/strict';
-assert.ok(process.env.PI_PACKAGE_DIR, 'set PI_PACKAGE_DIR explicitly');
-registerHooks({ resolve(specifier, context, nextResolve) {
-  if (specifier === '@earendil-works/pi-tui') return nextResolve(pathToFileURL(join(process.env.PI_PACKAGE_DIR, 'node_modules/@earendil-works/pi-tui/dist/index.js')).href, context);
-  return nextResolve(specifier, context);
-} });
+import { resolveDependency } from './offline-dependencies.mjs';
+registerHooks({ resolve: resolveDependency });

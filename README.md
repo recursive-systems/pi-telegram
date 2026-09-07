@@ -157,8 +157,8 @@ is unchanged. Menu metadata is never authorization.
 
 Registration has a two-second deadline, no retry loop and no per-message repeat;
 disconnect/shutdown cancels pending work. Diagnostics report `menuState` using
-fixed labels. Failure cannot block ingress, finalization, or handoff; `/commands`
-still works. A successful request does not prove the client has refreshed its menu.
+fixed labels. Failure does not block ordinary ingress or finalization; `/commands` still works.
+An in-flight transport that ignores cancellation can block lease handoff until it settles. A successful request does not prove the client has refreshed its menu.
 Existing language-specific lists or custom menu buttons may take precedence; v1
 does not overwrite those settings. Server-side menu changes are not transactional
 with reload, and a stale visible command never grants execution permission.
@@ -240,23 +240,10 @@ debounce and downloads. Each submitted prompt carries a unique turn marker;
 unrelated local/jobs prompts never claim Telegram replies. `stop` holds queued
 messages as ordered history for the next Telegram message.
 
-Run deterministic offline regression tests with Node **22.22+**:
-
-```bash
-npm test
-```
-
-Outside Pi's extension loader, Node must resolve the host-supplied peers. For an
-isolated checkout, use a **private** `node_modules` directory with package symlinks
-to an existing Pi host's TUI and existing baseline peer dependencies. Do not run
-an install against a `node_modules` symlink to another checkout. This avoids
-installing a second Pi runtime just to test. The lockfile retains the existing
-legacy peer dependency tree; npm's normal peer auto-install policy is unchanged.
-
-Formatter tests use the real public Pi-supplied Marked export. Queue tests use a
-temporary HOME, fake Pi lifecycle, mocked fetch, and fake timers. No bot,
-credentials, or model is used. The combined suite retains 57 queue/diagnostic,
-33 reload, and 51 formatter regressions, plus 10 cross-feature integration cases.
+Run deterministic offline regression tests with Node **22.22+** using the
+sanitized, separately grouped procedure under **Offline project and cross-factory tests**.
+Do not use an ungrouped `test/*.test.mjs`: boundaries intentionally replace global
+builtins. Declared peer dependencies must already be installed; the runner never installs them.
 
 The historical Telegram stall remains **unproven**. Offline tests reproduce a
 specific missed-finalization mechanism, not the original incident. Recovery only
@@ -380,19 +367,9 @@ that subsequent network requests will succeed.
 
 ### At-home test procedure (only after review)
 
-No live installation or reload is part of the offline test suite. In a checkout
-of the reviewed branch, with Node 22.22+ and a private dependency directory
-**without shared package symlinks** (for the read-only host-symlink arrangement
-above, skip `npm ci` and run `npm test` only):
-
-```bash
-npm ci --ignore-scripts
-npm test
-```
-
-Tests isolate HOME, use fake credentials/network/host, and exercise two freshly
-loaded extension instances with shared session entries. They never contact a
-bot or model. Existing queue regressions run alongside handoff tests.
+No live installation, migration or reload is part of the offline test suite.
+Use only the sanitized grouped procedure below; no `npm ci` or activation is
+required or authorized by passing tests.
 
 For an intentional live test **when you are home**, replace the placeholders
 below with the reviewed commit supplied by the maintainer and your recorded
@@ -461,13 +438,15 @@ model input, and cancelled ingress cannot restart optional menu work.
 
 Disconnect also pauses queued dispatch **in this instance**, not just new polling.
 In-progress preparation and the current reply can finish; accepted ordinary text,
-files, and albums remain queued in FIFO order, **only in memory**. Explicit
+files, and albums retain a volatile FIFO queue plus durable input/reference
+responsibility; attachment bytes and queue replay authority are not durable. Explicit
 `/telegram-connect` wakes eligible queued work once without clearing stop-history,
 uncertain-admission, or recovery holds. This is not durability across an ordinary
 restart. The handoff's
 internal poller stop is not cancellation. The supported cancellation boundary is
 before checkpoint/teardown; after the terminal reload call, host lifecycle owns the
-operation. Optional menu and identity tasks remain outside handoff barriers.
+operation. Pending menu, identity and other transports must settle before lease release;
+uncooperative cancellation can refuse replacement ownership.
 
 After independent offline review, owner-only live checks: verify stale configured
 username cannot control a different token's bot, then verify case-insensitive own
@@ -514,29 +493,65 @@ need manual reconciliation. No durable inbox, parent assessment ledger, crash
 recovery, send fallback repair or exactly-once guarantee is added. Existing send
 fallback ambiguity is unchanged.
 
-#### Offline cross-factory tests
+#### Offline project and cross-factory tests
 
-`test/job-origin.test.mjs` loads **both actual extension factories**, with a shared
-synchronous/caught-error event bus and a fake host/Telegram fetch. It is skipped
-unless `JOBS_SOURCE_ROOT` is explicitly set; production has no repository coupling.
-Use a sanitized private HOME and explicit installed package directory:
+Prerequisites: Node **22.22+** with synchronous module hooks/type stripping and
+already-installed declared project peers. From any checkout, select Node through
+your normal PATH **before** the runner sanitizes the child environment:
 
 ```sh
-SAFE_HOME=$(mktemp -d /tmp/pi-job-origin-home.XXXXXX)
-chmod 700 "$SAFE_HOME"
-env -i HOME="$SAFE_HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin \
-  PI_PACKAGE_DIR=/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent \
-  PI_OFFLINE=1 PI_TELEMETRY=0 JOBS_SOURCE_ROOT=/path/to/isolated/jobs-checkout \
-  node --import ./test/offline-bootstrap.mjs --experimental-strip-types \
-  --test test/*.test.mjs
+NODE=$(command -v node)
+"$NODE" test/run-offline.mjs # primary checks; no external jobs repository required
+# Equivalent: npm test
+"$NODE" test/run-offline.mjs lease # one fixed group, in its own private environment
 ```
 
-No installation is required: legacy peer resolution can use a read-only
-`node_modules` symlink to existing dependencies. `offline-bootstrap.mjs` resolves
-Pi's public parser from `PI_PACKAGE_DIR` when those older dependencies lack it;
-it does not import the host SDK. Audit test commands before running elsewhere.
-The fake fetch rejects all but exact `botFAKE-OFFLINE` URLs, cmux is absent from
-the sanitized environment, and jobs execute only scratch `printf`/`sleep` scripts.
+The runner uses a fresh mode-0700 HOME==TMPDIR for each explicit group, drops the
+inherited environment (including Node options), and installs the existing offline
+boundaries before factories. Primary groups are original, integration, config,
+store, lease, portability. Do not run an ungrouped test glob. In the original
+group, the 42 cross-factory cases are **skipped**, not passed, without jobs opt-in.
+Runner interruption (including SIGINT/SIGTERM) can leave private scratch directories;
+normal `finally` cleanup does not guarantee cleanup on signals.
+
+Ordinary project dependency resolution is the default. For an isolated worktree
+without peers, optionally supply absolute `PI_PACKAGE_DIR` (installed Pi package
+root, resolving its public parser peer) and `TYPEBOX_PACKAGE_DIR` (installed
+legacy `@sinclair/typebox` package root). Package entries are resolved through
+Node's standard package resolver, not private build paths; no host SDK is imported
+for discovery, no other checkouts are scanned, and nothing is downloaded.
+
+Optional producer/consumer compatibility tests load both actual factories only
+when the operator supplies an absolute `JOBS_SOURCE_ROOT` for a compatible jobs
+checkout. These additionally require `PI_PACKAGE_DIR` for the producer's installed
+loader/peers. They are not a prerequisite for the primary project checks:
+
+```sh
+JOBS_SOURCE_ROOT="$JOBS_SOURCE_ROOT" PI_PACKAGE_DIR="$PI_PACKAGE_DIR" \
+  "$NODE" test/run-offline.mjs original
+```
+
+Set those variables to operator-selected directories before that command; empty
+values are invalid. Optional dependency overrides are forwarded only by name.
+
+The **separate OS suite** is never run by default. It requires POSIX directory
+fsync and Python3 with stdlib `fcntl.flock`. Review the helper and private owner
+fixture first, then explicitly run:
+
+```sh
+"$NODE" test/run-offline.mjs lease-os
+# Optional absolute executable override: PI_TELEGRAM_PYTHON=/absolute/python3
+```
+
+Factory suites replace the exact lease helper with an inert file
+fixture and the exact two job-wrapper fixtures; job output/exit files are
+synthesized. **No Python, scratch script, real job or subprocess executes in
+factories.** Fake fetch permits only exact fake-bot URLs. Socket/HTTP/DNS
+Resolver/prototype/subprocess tripwires are defense in depth, **not an OS sandbox
+or a ban on every conceivable native networking route**. Only the opted-in OS
+suite executes one independently pinned Python inode with exact constant argv/fd
+and the exact private Node-owner fixture. No operational PIDs are probed/signaled.
+
 The protocol in `job-origin.ts` mirrors jobs' `origin.ts`; change/version together.
 
 
@@ -561,3 +576,133 @@ pending ownership. Cold restart recovery is not promised by this protocol.
 Source publication, package staging, extension activation/loading, and live
 acceptance are separate operator steps; none has been performed by this patch's
 offline verification.
+
+### Durable incoming admission (bounded; no cold replay)
+
+New authorized Telegram updates are retained under
+`~/.pi/agent/telegram-inbox/<opaque-scope>/snapshot.json` **before** committing the
+Telegram cursor or performing control/model effects. The scope is a
+domain-separated SHA-256 of the token and authenticated user ID; neither the token
+nor raw Telegram update is stored in the journal. Unsupported setup/login-like
+controls retain only a bounded non-execution classification, not their arguments.
+Private retained text/captions are sensitive. Media entries retain the exact opaque Telegram file ID, with safe
+optional name/MIME metadata: **reference-only, not durable attachment bytes or a
+promise that Telegram will still serve the file**.
+
+Pairing and cursor are one atomic config replacement; memory advances only after
+file and directory flush. Journal and config are separate files, not one atomic
+transaction. A retained duplicate never repeats control/model effects. Initial
+historical backlog skipping remains unchanged; there is no backfill. A missing
+cursor (or missing pairing over existing tentative journal state), malformed
+config, corrupt/foreign snapshot, or failed persistence requires operator repair,
+not automatic deletion, initialization, reconnect or reset.
+
+The bridge links incoming IDs through preparation, albums and stopped-history
+folding. A new authenticated executable `/stop` normally retains admission and
+held intent before applying local hold/abort, then commits the cursor. On
+admission/quota/poison/stop/config failure it still holds/aborts locally and stops
+unsafe intake/submission, without claiming durable stop or successful cursor
+commit. Admission/stop failure never attempts cursor commit. Config failure after
+rename may have changed disk; memory stays at its last confirmed cursor, with no
+later polling acknowledgement or rollback. Stale/foreign/invalid/caption controls
+and already-revoked intents do not execute. Disconnect during a pending cursor
+write cannot undo a safety stop already recorded/applied before that await.
+Slow downloads do not block intake of `/stop`.
+`dispatching` is persisted synchronously before Pi's **void** submission API;
+matching `before_agent_start` marks `active`, not successful completion. A failed
+active marker retains volatile reply/origin/attachment routing and uncertainty:
+the hook is not an execution veto, and no pre-agent abort is assumed to work. Only
+successful existing local finalization/control handling marks `handled` (including
+local abort/error reporting). This is **not goal completion, remote exactly-once
+delivery, or confirmation of asynchronous control completion**. Failed/partial
+final sends (including attachment failures even when the error notice succeeds)
+and synchronous submission errors after possible effects retain
+uncertainty; there are no new retries. Existing HTML/plain fallback remains.
+Already-live subsequent FIFO messages may still run after reply uncertainty, but
+uncertain ownership prevents identity changes and handoff. Synthetic job
+continuations create **no incoming journal records**.
+
+#### Local reconciliation
+
+Use the TUI command `/telegram-inbox` (or `summary`) for content-free scope,
+revision, stop latch and ID/phase/live counts. `/telegram-inbox show ID [PAGE]`
+displays a zero-based page of at most 4096 quoted characters of the full retained
+record, including metadata. The notification states the final page number.
+Inspect **every page** locally before ACK; media has a reference-only warning. It does not inject a model turn or send anything to Telegram.
+`/telegram-inbox acknowledge ID` requires a nonempty bounded reason and explicit
+confirmation, then rechecks scope, exact record and live ownership. It refuses
+all current volatile input, including preparing, held, submitted, active,
+finalizing, failed-preparation and uncertain work. It is not offered remotely,
+in RPC, or as a tool.
+
+On cold/new/resumed/ordinary-reload activation, old nonterminal records are
+**excluded from the live queue**. Explicit connection may retain new current-
+process input but ordinary dispatch is gated until old ownership is reconciled.
+Acknowledging the last old record may unblock those **new live queued inputs**;
+it NEVER submits the old records and does not clear the stop latch. Persistence
+failures need separately authorized repair; ACK is not a reset operation.
+
+The existing one-shot same-process `/telegram-reload` capability remains the only
+live queue handoff. Its checkpoint must agree on journal scope/revision/latch,
+incoming IDs, immutable session/epoch and turn markers before restoring work.
+Legacy permitted same-process checkpoints without incoming IDs remain compatible,
+with a local warning that those turns are **not newly journal-protected**. Any
+disagreement fails closed. Session entries alone never authorize replay.
+
+#### One private profile writer, not a universal bot lock
+
+One stable domain-separated profile lock protects this HOME profile's shared
+`telegram.json`, first-unpaired intake, setup, and all journal scopes, independent
+of token/principal. It is acquired before any polling/API acknowledgement,
+configuration mutation, store open or local ACK. It does **not** coordinate other
+HOME profiles, other bot clients or a headless bridge using the same token;
+existing external one-poller coordination remains necessary.
+
+Runtime prerequisites: POSIX owned private directories, `O_NOFOLLOW`, directory
+fsync, and Python3 with stdlib `fcntl.flock` (not Windows support).
+On acquisition, a read-only lazy resolver selects the first executable `python3`
+in absolute PATH entries. Empty and relative entries (including `.`) are ignored; lookup is bounded
+to 128 entries, 32 KiB total and 4096 bytes per path. Alternatively set
+`PI_TELEGRAM_PYTHON` to one absolute Python3 executable (no arguments). An invalid
+explicit override fails closed, never falls back. The operator must trust that
+executable and PATH directories just as with the Node/Pi launcher; no candidates
+are executed for discovery. Symlinked installed interpreters are supported.
+The fixed isolated helper runs with `-I -S -c` constant code, no shell, no
+configured arguments, only LANG/LC_ALL in its environment, fd3, and a three-second
+timeout. Node retains the exclusive descriptor after helper exit. The mode-0700
+journal root contains one stable empty mode-0600 `<profile-hash>.lock`; it is
+**never deleted**, including after release. Missing support/contention fails
+closed. Sanitized `python-unavailable` or `python-override-invalid` means install/provide
+Python3 or correct the absolute override/PATH; `helper-unavailable` means verify
+that the selected interpreter supports isolated mode and stdlib fcntl on this
+POSIX filesystem. Diagnostics never expose the selected path or helper stderr.
+Do not delete lockfiles or guess stale PIDs to resolve contention.
+
+Acquisition is lazy, never at factory evaluation. Disconnect releases only after
+all related volatile work is quiescent and the store is closed; otherwise it
+retains ownership. Shutdown prevents further dispatch and defers descriptor
+release until ongoing preparations/transports/finalizers settle. An uncooperative
+old transport can therefore refuse a new factory's handoff rather than permit
+concurrent writers. Kernel release on process exit does not authorize reconnect
+or replay. A retired lease handle is not proof of release: ambiguous close is
+never retried (the descriptor may be recycled), retains in-process exclusion and
+latches controller refusal of later connect/setup/API/config/store/ACK activity.
+Acquisition cleanup uncertainty is reported with sanitized fixed error codes.
+New/switch/fork runtimes receive no automatic connection authority.
+
+The store bounds each scope to 256 retained records and a 4 MiB canonical
+snapshot (including reserved transition headroom); text/caption are each 64 KiB,
+media references at most 16, file IDs at most 1024 bytes. Unresolved records are
+never evicted. Only terminal records covered by the successfully persisted cursor
+are compacted/pruned, with 32 recent tombstones retained. Quota blocks intake;
+this is not a blob store, watchdog, job ledger or broader reliability framework.
+Atomic rename/fsync is a local-filesystem boundary, not a hardware power-loss or
+network-filesystem guarantee. Sync metadata operations can block the event loop.
+Old scopes and abandoned temporary files require deliberate offline housekeeping;
+no automatic migration/garbage collection is performed across scopes.
+
+Before rollback to a version without admission, account for retained unresolved
+ownership and stop intake; older versions do not honor this journal or lease.
+Do not reset cursors, strip checkpoint IDs or run an older writer over unresolved
+state. This implementation and its offline tests do not constitute publication,
+installation, runtime activation, migration or live acceptance.

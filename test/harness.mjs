@@ -1,11 +1,13 @@
+import { leaseBoundary } from './admission-harness-boundary.mjs';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
-import { appendFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { appendFileSync, readFileSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
 import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname, basename } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
 
 export const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
@@ -18,15 +20,22 @@ export const assistant = (text = 'answer', stopReason = 'stop') => ({ role: 'ass
 export async function harness(t, options = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const home = await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
-  const oldHome = process.env.HOME;
-  process.env.HOME = home;
+  leaseBoundary.roots.add(join(home, '.pi/agent/telegram-inbox'));
+  const oldHome = process.env.HOME, oldTmp = process.env.TMPDIR;
+  process.env.HOME = home; process.env.TMPDIR = home;
   await mkdir(join(home, '.pi/agent'), { recursive: true });
   await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0, ...options.config }));
   let configWrite = async () => {}, pollSignal;
-  const originalWriteFile = fsPromises.writeFile;
-  const writeMock = t.mock.method(fsPromises, 'writeFile', async (path, ...args) => {
-    if (path === join(home, '.pi/agent/telegram.json')) await configWrite(JSON.parse(args[0]));
-    return originalWriteFile(path, ...args);
+  const originalOpen = fsPromises.open;
+  const writeMock = t.mock.method(fsPromises, 'open', async (path, ...args) => {
+    const handle = await originalOpen(path, ...args);
+    // Exact private config temporary identity, exclusive creation only.
+    if (typeof path === 'string' && dirname(path) === join(home, '.pi/agent') && /^\.telegram-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.test(basename(path))) {
+      assert.deepEqual(args, ['wx', 0o600]);
+      const write = handle.writeFile.bind(handle);
+      handle.writeFile = async (...values) => { await configWrite(JSON.parse(values[0])); return write(...values); };
+    }
+    return handle;
   });
   syncBuiltinESMExports();
   t.after(() => { writeMock.mock.restore(); syncBuiltinESMExports(); });
@@ -43,7 +52,10 @@ export async function harness(t, options = {}) {
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
   let reloadMode = 'normal', sessionFileRead = () => {};
   let idle = true, compacting = false, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
-  const emit = async (name, event = {}) => handlers.get(name)?.({ type: name, ...event }, ctx);
+  const emit = async (name, event = {}) => {
+    try { return await handlers.get(name)?.({ type: name, ...event }, ctx); }
+    catch (error) { if (!options.faithfulHost) throw error; errors.push(error); }
+  };
   async function instantiate(omitExtension = false) {
     handlers = new Map(); commands = new Map(); tools = new Map();
     flagValues = new Map(); registrations = []; factoryTools = [];
@@ -59,7 +71,7 @@ export async function harness(t, options = {}) {
       waitForIdle: async () => { check(); if (!idle || compacting) await idleWaiter.promise; },
       sessionManager: { getEntries: () => { check(); return entries; }, getSessionId: () => { check(); return sessionId; },
         getSessionFile: () => { check(); sessionFileRead(); return sessionFile; } },
-      ui: { setWidget() {}, theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
+      ui: { input: async (...args) => options.input?.(...args), confirm: async (...args) => options.confirm?.(...args) ?? false, setWidget() {}, theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
         notify: (text, level) => { check(); notices.push({ text, level }); } },
       reload: async () => {
         check();
@@ -84,7 +96,13 @@ export async function harness(t, options = {}) {
       return;
     }
     const ownCommands = commands;
-    const extension = omitExtension ? undefined : (await import(`../index.ts?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
+    let source = '../index.ts';
+    if (options.sourceKnownBaseline) {
+      source = '../.admission-preintegration.fixture.ts';
+      assert.equal(createHash('sha256').update(readFileSync(new URL(source, import.meta.url))).digest('hex'),
+        '607470c3d6766a20c58d7ce3b9326f5692d629a681a1d3fee16beb0691b2748b');
+    }
+    const extension = omitExtension ? undefined : (await import(`${source}?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
     const api = { events: {
       emit: (name, data) => { check(); bus.emit(name, data); },
       on: (name, handler) => {
@@ -170,6 +188,7 @@ export async function harness(t, options = {}) {
       const id = ++updateId;
       serverUpdates.push({ update_id: id, message: { message_id: id, chat: { id: 70, type: 'private' }, from: { id: 7 }, text, ...extra } });
     },
+    deliver(update) { const request = poll; poll = undefined; request.resolve([update]); },
     push(text, extra = {}) { const request = poll; poll = undefined; const id = ++updateId; request.resolve([{ update_id: id, message: { message_id: id, chat: { id: 70, type: "private" }, from: { id: 7 }, text, ...extra } }]); },
     get pollAborted() { return pollSignal?.aborted; },
     get generation() { return generation; }, get maxPolls() { return maxPolls; }, get polling() { return !!poll; },
@@ -180,7 +199,12 @@ export async function harness(t, options = {}) {
     command: (name, args = '') => commands.get(name).handler(args, ctx),
     reloadTool: () => tools.get('telegram_reload').execute('call', {}, undefined, undefined, ctx),
     async replace(reason, omitExtension = false) {
-      await emit('session_shutdown', { reason }); invalidate(); restoredFlags = new Map(flagValues); await instantiate(omitExtension); await emit('session_start', { reason });
+      if (options.faithfulHost && ['new', 'resume', 'fork'].includes(reason)) {
+        lifecycle.push('abort'); h.aborts++;
+        if (!idle) { await h.end('', 'aborted'); await h.settle(); }
+        lifecycle.push('settled');
+      }
+      await emit('session_shutdown', { reason }); lifecycle.push('shutdown'); invalidate(); restoredFlags = new Map(flagValues); await instantiate(omitExtension); await emit('session_start', { reason });
     },
     // Real Pi wrapper returns void; promise rejection goes to the error listener.
     asyncAdmission(preflight = async () => {}, transform = x => x) {
@@ -240,7 +264,7 @@ export async function harness(t, options = {}) {
     attach: paths => tools.get('telegram_attach').execute('call', { paths }),
     async shutdown() { await emit('session_shutdown'); },
   };
-  t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; await rm(home, { recursive: true, force: true }); });
+  t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; process.env.TMPDIR = oldTmp; leaseBoundary.roots.delete(join(home, '.pi/agent/telegram-inbox')); await rm(home, { recursive: true, force: true }); });
   await instantiate();
   await emit('session_start', { reason: options.sessionReason ?? 'startup' });
   if (options.connected !== false) {

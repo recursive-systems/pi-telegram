@@ -109,11 +109,12 @@ test('Pi follow-up user messages cannot leak text or attachments into Telegram r
   assert.ok(!h.network.some(n => n.body.text === 'LOCAL OUTPUT'));
 });
 
-test('synchronous submission rejection retains queued content', async t => {
+test('synchronous submission error after effects retains uncertain ownership without retry', async t => {
   const h = await harness(t); h.onSend = () => { throw new Error('rejected'); };
   await h.receive('retain me'); assert.match(h.statuses.at(-1), /submission failed/);
   h.onSend = () => {}; await h.settle();
-  assert.equal(h.sent.length, 2); assert.deepEqual(h.sent[0], h.sent[1]);
+  assert.equal(h.sent.length, 1); assert.equal((await h.diagnostic()).uncertainReply, true);
+  assert.equal((await h.diagnostic()).submitted, true);
 });
 
 test('shutdown cancels polling, preview and album timers; later hooks cannot submit', async t => {
