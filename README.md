@@ -476,3 +476,88 @@ a reload receipt is delayed and confirm no reconnect; test a duplicate command
 collision is refused; finally test authorized reload with queued files/FIFO and
 one poller. Check the private menu in the client (API success is not cache refresh).
 No live acceptance or publication readiness is claimed by the offline suite.
+
+### Background completion reply routing
+
+The jobs extension can capture the origin of an active **routing** Telegram turn
+through public `pi.events`. On completion it requests a synchronous claim for
+that exact original request. The bridge verifies the bounded versioned descriptor,
+same-session identity, configuration digest, per-factory epoch, stop generation,
+and integrity signature before accepting. The signature uses the existing
+process-local reload key; it prevents edited record fields from redirecting a
+reply, but is not a malicious-same-process sandbox.
+
+Claims require a connected, idle bridge with no submitted/active/preflight turn,
+FIFO/preparation/album debt, finalization, compaction, reload, stop-history,
+disconnection/recovery, or uncertain-reply hold. An unavailable claim remains
+pending in the job record, never becomes local input or another chat's answer.
+Relevant normal lifecycle drains emit a small readiness hint for the jobs
+extension's existing 500ms coalescer; there is no new watchdog.
+
+Accepted completions use the ordinary owned Telegram queue, fresh submitted
+marker, active turn, parent-model assessment and text/file finalizer.
+`telegram_attach` works as usual. Continuation text/files reply to the original
+message in the original private chat (including draft/message-preview paths).
+The prompt identifies background results, not a fresh human instruction.
+Descendant jobs inherit the **original** request, not an intervening conversation.
+
+The optional reload checkpoint `bridgeEpoch` is restored only under the existing
+one-shot, armed, unexpired, same-session/config/cursor live permit. Ordinary reload,
+new/forked sessions and cold factories get new epochs; saved origins do not
+reconnect or authorize replay. Any `/stop` invalidates older automatic
+continuations even after unrelated new input. Explicit same-epoch reconnect may
+release a disconnected origin, but never changes its destination.
+
+Claim acknowledgement is queue ownership only. Pi's void `sendUserMessage` does
+not expose asynchronous admission failures; a submitted continuation can still
+need manual reconciliation. No durable inbox, parent assessment ledger, crash
+recovery, send fallback repair or exactly-once guarantee is added. Existing send
+fallback ambiguity is unchanged.
+
+#### Offline cross-factory tests
+
+`test/job-origin.test.mjs` loads **both actual extension factories**, with a shared
+synchronous/caught-error event bus and a fake host/Telegram fetch. It is skipped
+unless `JOBS_SOURCE_ROOT` is explicitly set; production has no repository coupling.
+Use a sanitized private HOME and explicit installed package directory:
+
+```sh
+SAFE_HOME=$(mktemp -d /tmp/pi-job-origin-home.XXXXXX)
+chmod 700 "$SAFE_HOME"
+env -i HOME="$SAFE_HOME" PATH=/opt/homebrew/bin:/usr/bin:/bin \
+  PI_PACKAGE_DIR=/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent \
+  PI_OFFLINE=1 PI_TELEMETRY=0 JOBS_SOURCE_ROOT=/path/to/isolated/jobs-checkout \
+  node --import ./test/offline-bootstrap.mjs --experimental-strip-types \
+  --test test/*.test.mjs
+```
+
+No installation is required: legacy peer resolution can use a read-only
+`node_modules` symlink to existing dependencies. `offline-bootstrap.mjs` resolves
+Pi's public parser from `PI_PACKAGE_DIR` when those older dependencies lack it;
+it does not import the host SDK. Audit test commands before running elsewhere.
+The fake fetch rejects all but exact `botFAKE-OFFLINE` URLs, cmux is absent from
+the sanitized environment, and jobs execute only scratch `printf`/`sleep` scripts.
+The protocol in `job-origin.ts` mirrors jobs' `origin.ts`; change/version together.
+
+
+### Paired load and safe rollback
+
+Both compatible jobs producer and Telegram consumer implementations must be
+**loaded before origin capture**. Publishing source or staging a package is not
+loading it. With an old or missing capture consumer, new jobs remain local;
+existing uncaptured records also remain local. Never retag them or infer an
+origin from the last chat. The new jobs producer holds captured origins pending
+when their consumer is missing, incompatible, or otherwise ineligible. An **old
+jobs producer cannot be assumed to honor captured origins**.
+
+Before rollback, account for captured pending ownership and any already
+transferred bridge-owned continuations. Keep the compatible producer/consumer
+loaded to settle eligible work, or retain the records and suspend processing
+until a compatible pair can safely resume within its valid session/epoch gates.
+Do not run an old producer over captured pending records, erase origin metadata
+or notification flags, or blindly replay work: rollback must not drop captured
+pending ownership. Cold restart recovery is not promised by this protocol.
+
+Source publication, package staging, extension activation/loading, and live
+acceptance are separate operator steps; none has been performed by this patch's
+offline verification.

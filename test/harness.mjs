@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
 import { appendFileSync } from 'node:fs';
 import fsPromises from 'node:fs/promises';
@@ -31,6 +32,7 @@ export async function harness(t, options = {}) {
   t.after(() => { writeMock.mock.restore(); syncBuiltinESMExports(); });
   let handlers, commands, tools, ctx, invalidate, flagValues, registrations, factoryTools, factoryFlag;
   let restoredFlags;
+  const bus = new EventEmitter();
   const compactions = [];
   const identityUsername = options.identity ?? options.config?.botUsername;
   let discovered = options.discovered ?? [], commandSubmission = options.commandSubmission;
@@ -47,8 +49,9 @@ export async function harness(t, options = {}) {
     flagValues = new Map(); registrations = []; factoryTools = [];
     let valid = true;
     const check = () => assert.ok(valid, 'stale host API used');
-    invalidate = () => { valid = false; };
+    invalidate = () => { valid = false; bus.removeAllListeners(); };
     const ownCtx = ctx = {
+      cwd: home, mode: "tui", hasUI: true,
       getContextUsage: () => { check(); return undefined; },
       compact: opts => { check(); compactions.push(opts); },
       isIdle: () => { check(); return idle && !compacting; }, hasPendingMessages: () => { check(); return pending; },
@@ -56,7 +59,7 @@ export async function harness(t, options = {}) {
       waitForIdle: async () => { check(); if (!idle || compacting) await idleWaiter.promise; },
       sessionManager: { getEntries: () => { check(); return entries; }, getSessionId: () => { check(); return sessionId; },
         getSessionFile: () => { check(); sessionFileRead(); return sessionFile; } },
-      ui: { theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
+      ui: { setWidget() {}, theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
         notify: (text, level) => { check(); notices.push({ text, level }); } },
       reload: async () => {
         check();
@@ -75,14 +78,25 @@ export async function harness(t, options = {}) {
       },
     };
     generation++;
-    if (omitExtension) {
+    if (omitExtension && !options.jobsFactory) {
       // _buildRuntime restores runtime flags even if imports omitted this extension.
       for (const [name, value] of restoredFlags ?? []) flagValues.set(name, value);
       return;
     }
     const ownCommands = commands;
-    const extension = (await import(`../index.ts?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
-    extension({ on: (name, fn) => handlers.set(name, fn), registerCommand: (name, command) => commands.set(name, command),
+    const extension = omitExtension ? undefined : (await import(`../index.ts?home=${encodeURIComponent(home)}&instance=${generation}`)).default;
+    const api = { events: {
+      emit: (name, data) => { check(); bus.emit(name, data); },
+      on: (name, handler) => {
+        check();
+        const safe = async data => { try { await handler(data); } catch (error) { errors.push(error); } };
+        bus.on(name, safe); return () => bus.off(name, safe);
+      },
+    }, registerEntryRenderer() {}, getSessionName: () => 'Offline',
+    on: (name, fn) => {
+      const prior = handlers.get(name);
+      handlers.set(name, prior ? async (...args) => { await prior(...args); return fn(...args); } : fn);
+    }, registerCommand: (name, command) => commands.set(name, command),
       registerFlag: (name, options) => { if (!flagValues.has(name)) flagValues.set(name, options.default); },
       getCommands: () => { check(); if (options.catalogThrows) throw new Error('SECRET'); return [...(options.reloadCatalog ?? [{ name: 'telegram-reload', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } }]), ...discovered]; },
       getFlag: name => { check(); return flagValues.get(name); },
@@ -105,7 +119,10 @@ export async function harness(t, options = {}) {
         }
         sent.push(content); onSend(content);
       },
-    });
+    };
+    if (options.jobsFirst) options.jobsFactory?.(api);
+    extension?.(api);
+    if (!options.jobsFirst) options.jobsFactory?.(api);
     factoryTools.push(...tools.keys());
     factoryFlag = flagValues.get('telegram-diagnostics');
     // Host factories see defaults; CLI overrides/restored flags precede startup.
@@ -141,7 +158,7 @@ export async function harness(t, options = {}) {
     return { json: async () => ({ ok: true, result: method === 'getMe' ? { username: identityUsername } : method === 'getFile' ? { file_path: 'fake.txt' } : { message_id: network.length } }) };
   });
   const h = {
-    home, sent, network, compactions, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    bus, home, sent, network, compactions, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
     set configWrite(value) { configWrite = value; },
     set discovered(value) { discovered = value; }, set commandSubmission(value) { commandSubmission = value; },
     get handlers() { return handlers; },
@@ -162,8 +179,8 @@ export async function harness(t, options = {}) {
     set sessionId(value) { sessionId = value; }, set sessionFile(value) { sessionFile = value; },
     command: (name, args = '') => commands.get(name).handler(args, ctx),
     reloadTool: () => tools.get('telegram_reload').execute('call', {}, undefined, undefined, ctx),
-    async replace(reason) {
-      await emit('session_shutdown', { reason }); invalidate(); restoredFlags = new Map(flagValues); await instantiate(); await emit('session_start', { reason });
+    async replace(reason, omitExtension = false) {
+      await emit('session_shutdown', { reason }); invalidate(); restoredFlags = new Map(flagValues); await instantiate(omitExtension); await emit('session_start', { reason });
     },
     // Real Pi wrapper returns void; promise rejection goes to the error listener.
     asyncAdmission(preflight = async () => {}, transform = x => x) {
