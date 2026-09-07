@@ -227,11 +227,11 @@ test('claim append failure retains the checkpoint, revokes capability, and block
 test('ingress failure after cursor write is evidence, not a certified empty snapshot', async t => {
   const h = await harness(t);
   h.networkGate = async method => { if (method === 'sendMessage') throw new Error('command reply failed'); };
-  // receive() waits for a replacement poll, which is intentionally delayed by
-  // the normal poller's error backoff. Release that fake timer explicitly.
-  const receiving = h.receive('stop'); await until(() => h.statuses.some(s => s.includes('command reply failed')));
+  // Admission/control failure now fails closed rather than polling past an
+  // unresolved effect. The cursor and durable record remain available for repair.
+  h.push('stop'); await until(() => h.statuses.some(s => s.includes('admission interrupted')));
   await h.command('telegram-reload'); assert.equal(h.generation, 1); assert.equal(snapshots(h).length, 0);
-  h.networkGate = undefined; t.mock.timers.tick(3000); await receiving;
+  h.networkGate = undefined; t.mock.timers.tick(3000); assert.equal(h.polling, false);
   await h.command('telegram-status'); assert.match(h.notices.at(-1).text, /failed preparations\/ingress: 0\/1/);
 });
 

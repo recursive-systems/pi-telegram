@@ -172,8 +172,8 @@ test('reload reservation holds FIFO even while receipt hangs and current run set
   const receiving = h.receive('/telegram_reload'); await until(() => entered);
   await h.end('final'); await h.settle(); await tick();
   assert.equal(h.sent.length, 1); assert.equal((await h.diagnostic()).reloadPending, true);
-  t.mock.timers.tick(2000); await receiving; await until(() => h.generation === 2 && h.sent.length === 2);
-  gate.resolve(); assert.equal(h.maxPolls, 1);
+  t.mock.timers.tick(2000); gate.resolve(); await receiving; await until(() => h.generation === 2 && h.sent.length === 2);
+  assert.equal(h.maxPolls, 1);
 });
 
 for (const field of ['business_connection_id', 'guest_query_id']) test('alternate chat context does not target ordinary private menu: ' + field, async t => {
@@ -268,14 +268,14 @@ test('catalog can change during receipt: cancel only own reservation and preserv
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).reloadPending, false); assert.equal((await h.diagnostic()).held, true);
 });
 
-for (const control of ['/telegram_reload', '/stop', '/compact']) test('cursor accepted before disconnect does not admit stale control ' + control, async t => {
+for (const control of ['/telegram_reload', '/stop', '/compact']) test('disconnect during cursor commit revokes later controls, not already-recorded safety stop ' + control, async t => {
   const h = await harness(t); const gate = deferred(); let entered = false;
   h.configWrite = async () => { entered = true; await gate.promise; };
   h.push(control); await until(() => entered);
   const disconnecting = h.command('telegram-disconnect'); gate.resolve(); await disconnecting; await tick();
   assert.equal(h.submissions.length, 0); assert.equal(h.entries.length, 0);
   assert.equal(h.generation, 1); assert.equal(h.polling, false);
-  assert.equal(h.compactions.length, 0); assert.equal((await h.diagnostic()).held, false);
+  assert.equal(h.compactions.length, 0); assert.equal((await h.diagnostic()).held, control === '/stop');
   assert.equal(h.network.filter(n => n.method === 'setMyCommands').length, 0);
   assert.equal(JSON.parse(await readFile(join(h.home, '.pi/agent/telegram.json'), 'utf8')).lastUpdateId, 1);
 });
@@ -283,7 +283,7 @@ for (const control of ['/telegram_reload', '/stop', '/compact']) test('cursor ac
 for (const boundary of ['pairing-write', 'pairing-reply']) test('origin intent survives ' + boundary, async t => {
   const h = await harness(t, { config: { allowedUserId: undefined } });
   const gate = deferred(); let entered = false, writes = 0;
-  h.configWrite = async () => { if (++writes === 2 && boundary === 'pairing-write') { entered = true; await gate.promise; } };
+  h.configWrite = async () => { if (++writes === 1 && boundary === 'pairing-write') { entered = true; await gate.promise; } };
   h.networkGate = async (method, body) => {
     if (boundary === 'pairing-reply' && method === 'sendMessage' && body.text.includes('paired')) { entered = true; await gate.promise; }
   };

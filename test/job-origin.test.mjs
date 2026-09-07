@@ -337,6 +337,7 @@ test('origin listeners unsubscribe before host teardown and ready hints remain b
     assert.equal(h.bus.listenerCount(name), 1);
     assert.ok(!h.bus.listeners(name).includes(old[i][0]));
   });
+  await wake(t); // Drain the explicit connection's initial readiness hint first.
   let ready = 0, claims = 0;
   h.bus.on(names[2], () => ready++);
   h.bus.on(names[1], () => claims++);

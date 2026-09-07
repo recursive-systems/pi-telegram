@@ -1,3 +1,7 @@
+import { mkdirSync, realpathSync, readdirSync } from "node:fs";
+import { AdmissionStore, type AdmissionInput, type AdmissionPhase, type TelegramMediaReference } from "./admission-store.ts";
+import { AdmissionLease } from "./admission-lease.ts";
+import { persistTelegramConfig } from "./admission-config.ts";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
@@ -107,6 +111,7 @@ interface TelegramMessage {
 	photo?: TelegramPhotoSize[];
 	document?: TelegramDocument;
 	video?: TelegramVideo;
+	video_note?: { file_id: string };
 	audio?: TelegramAudio;
 	voice?: TelegramVoice;
 	animation?: TelegramAnimation;
@@ -135,6 +140,7 @@ interface DownloadedTelegramFile {
 }
 
 interface PendingTelegramTurn {
+	incomingIds?: number[];
 	origin?: JobOrigin;
 	marker: string;
 	chatId: number;
@@ -171,6 +177,7 @@ interface TelegramMediaGroupState {
 // Only a live, one-shot capability can authorize restoration. Session entries alone
 // (including copied/forked entries) never authorize a connection. No credentials here.
 interface ReloadCheckpoint {
+	admission?: { scope: string; generation: number; stopLatched: boolean };
 	bridgeEpoch?: string;
 	version: 1;
 	reason: "telegram-reload";
@@ -194,8 +201,9 @@ const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(va
 const configDigest = (config: TelegramConfig) => createHmac("sha256", reloadState.key)
 	.update(JSON.stringify([config.botToken, config.botId, config.botUsername, config.allowedUserId])).digest("hex");
 
-const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
-const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+const PROFILE_HOME = homedir();
+const CONFIG_PATH = join(PROFILE_HOME, ".pi", "agent", "telegram.json");
+const TEMP_DIR = join(PROFILE_HOME, ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -338,15 +346,14 @@ async function readConfig(): Promise<TelegramConfig> {
 	try {
 		const content = await readFile(CONFIG_PATH, "utf8");
 		const parsed = JSON.parse(content) as TelegramConfig;
+		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed) || Object.keys(parsed).some(key => !["botToken", "botUsername", "botId", "allowedUserId", "lastUpdateId"].includes(key))) throw new Error("invalid config");
+		for (const key of ["botToken", "botUsername"] as const) if (parsed[key] !== undefined && (typeof parsed[key] !== "string" || parsed[key]!.length > 4096 || !parsed[key]!.length)) throw new Error("invalid config");
+		for (const key of ["botId", "allowedUserId", "lastUpdateId"] as const) if (parsed[key] !== undefined && (!Number.isSafeInteger(parsed[key]) || parsed[key]! < (key === "lastUpdateId" ? 0 : 1))) throw new Error("invalid config");
 		return parsed;
-	} catch {
-		return {};
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return {};
+		throw new Error("Telegram configuration invalid; operator repair required");
 	}
-}
-
-async function writeConfig(config: TelegramConfig): Promise<void> {
-	await mkdir(join(homedir(), ".pi", "agent"), { recursive: true });
-	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -367,7 +374,7 @@ export default function (pi: ExtensionAPI) {
 	let restoredDisconnected = false;
 	let uncertainReply: ActiveTelegramTurn | undefined;
 	const failedPreparations: TelegramMessage[][] = [];
-	const failedIngress: TelegramUpdate[] = [];
+	const failedIngress: Array<{ updateId?: number }> = [];
 	const replyWaiters: Array<() => void> = [];
 	let menuAttempted = false;
 	let menuState = "not-attempted";
@@ -403,6 +410,114 @@ export default function (pi: ExtensionAPI) {
 	let draftSupport: "unknown" | "supported" | "unsupported" = "unknown";
 	let nextDraftId = 0;
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
+	let profileLease: AdmissionLease | undefined;
+	let inbox: AdmissionStore | undefined;
+	let inboxRoot: string | undefined;
+	let inboxFault = false;
+	let leaseUncertain = false;
+	const retainedIncoming = new Set<number>();
+	let apiCalls = 0;
+	const liveIncoming = new Set<number>();
+	const coldIncoming = new Set<number>();
+	const messageIds = new WeakMap<TelegramMessage, number>();
+	const terminalPhase = (phase: AdmissionPhase) => phase === "handled" || phase === "acknowledged";
+	function ensureLease(): void {
+		if (closed) throw new Error("Telegram session closed");
+		if (leaseUncertain || profileLease?.retired) throw new Error("Telegram lease ownership uncertain; operator repair required");
+		if (profileLease) return;
+		// Canonicalize only the trusted HOME alias; lease validates every ancestor.
+		const root = join(realpathSync(PROFILE_HOME), ".pi", "agent", "telegram-inbox");
+		try { mkdirSync(root, { mode: 0o700 }); }
+		catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Telegram inbox unavailable"); }
+		try { profileLease = AdmissionLease.acquire(root, digest(["pi-telegram/profile-writer/v1"])); }
+		catch (error) { leaseUncertain = true; throw error; }
+		inboxRoot = root;
+	}
+	function scopeFor(principal: number): string {
+		return digest(["pi-telegram/admission-records/v1", config.botToken, principal]);
+	}
+	function openInbox(principal = config.allowedUserId): void {
+		if (inboxFault) throw new Error("Telegram inbox requires operator repair");
+		ensureLease();
+		if (principal === undefined) return;
+		const scope = scopeFor(principal);
+		if (inbox?.inspect().scope === scope) {
+			if (config.lastUpdateId === undefined && inbox.inspect().records.length) {
+				inboxFault = true; throw new Error("Telegram cursor missing; operator repair required");
+			}
+			return;
+		}
+		if (liveIncoming.size || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply)
+			throw new Error("Telegram identity change refused: live ownership");
+		inbox?.close(); inbox = undefined; coldIncoming.clear();
+		inbox = AdmissionStore.open(inboxRoot!, scope);
+		const snapshot = inbox.inspect();
+		retainedIncoming.clear();
+		for (const record of snapshot.records) retainedIncoming.add(record.updateId);
+		for (const record of snapshot.records) if (!terminalPhase(record.phase)) coldIncoming.add(record.updateId);
+		preserveQueuedTurnsAsHistory = snapshot.stopLatched;
+		if (config.lastUpdateId === undefined && snapshot.records.length) { inboxFault = true; throw new Error("Telegram cursor missing; operator repair required"); }
+	}
+	function maybeReleaseLease(): void {
+		// Disconnect alone cannot abandon volatile ownership. Closed callbacks can
+		// no longer dispatch; wait for every transport/preparation/finalizer first.
+		if (!profileLease || pollingPromise || setupInProgress || apiCalls || preparationCount || finalizingReply) return;
+		if (!closed && (liveIncoming.size || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || uncertainReply || failedIngress.length || failedPreparations.length)) return;
+		if (!closed && !restoredDisconnected) return;
+		inbox?.close(); inbox = undefined;
+		const lease = profileLease; profileLease = undefined;
+		try { lease.release(); } catch { leaseUncertain = true; inboxFault = true; }
+	}
+	function journalTurn(turn: PendingTelegramTurn, phase: AdmissionPhase): void {
+		const ids = turn.incomingIds ?? [];
+		if (!ids.length) return; // Synthetic continuations and permitted legacy turns.
+		if (closed || !inbox || inboxFault) throw new Error("Telegram admission unavailable");
+		try {
+			inbox.transition(ids.map(updateId => ({ updateId, phase, turnMarker: turn.marker,
+				...(terminalPhase(phase) ? { disposition: { at: Date.now(), note: "Successful local handling only; not goal completion or exactly-once delivery." } } : {}) })));
+			if (terminalPhase(phase)) for (const id of ids) liveIncoming.delete(id);
+		} catch { inboxFault = true; throw new Error("Telegram admission transition failed; operator repair required"); }
+	}
+	function messageIncomingIds(messages: TelegramMessage[]): number[] {
+		return messages.flatMap(message => { const id = messageIds.get(message); return id === undefined ? [] : [id]; });
+	}
+	function telegramControl(message: TelegramMessage) {
+		const standalone = typeof message.text === "string" && !message.caption && !message.media_group_id && !message.photo && !message.document &&
+			!message.video_note && !message.video && !message.audio && !message.voice && !message.animation && !message.sticker;
+		return standalone ? parseTelegramCommand(message.text!, verifiedToken === config.botToken ? verifiedUsername : undefined) : undefined;
+	}
+	function admissionDTO(update: TelegramUpdate, message: TelegramMessage, ctx: ExtensionContext): AdmissionInput {
+		const media: TelegramMediaReference[] = [];
+		const add = (type: TelegramMediaReference["type"], file: { file_id: string; file_name?: string; mime_type?: string } | undefined) => {
+			if (!file) return;
+			const name = file.file_name ? sanitizeFileName(basename(file.file_name)).slice(0, 255) : undefined;
+			const mime = file.mime_type && file.mime_type.length <= 127 && /^[a-zA-Z0-9!#$&^_.+-]+\/[a-zA-Z0-9!#$&^_.+-]+$/.test(file.mime_type) ? file.mime_type : undefined;
+			media.push({ retention: "telegram-reference-only", type, fileId: file.file_id,
+				...(name && name !== "." && name !== ".." ? { name } : {}), ...(mime ? { mime } : {}) });
+		};
+		add("photo", message.photo?.at(-1));
+		for (const type of ["document", "audio", "voice", "video", "video_note", "animation", "sticker"] as const) add(type, message[type]);
+		const control = telegramControl(message);
+		// Unsupported setup/login-like commands may contain credentials. Retain
+		// only their bounded non-execution classification, never arbitrary fields.
+		const retainedText = control?.foreign ? "[telegram-control:foreign]" : control && !telegramCommands.some(route => route.command === control.name)
+			? "[telegram-control:unsupported]" : message.text;
+		return { sessionId: ctx.sessionManager.getSessionId(), epoch: bridgeEpoch, updateId: update.update_id,
+			chatId: message.chat.id, userId: message.from!.id, messageId: message.message_id, receivedAt: Date.now(),
+			...(retainedText !== undefined ? { text: retainedText } : {}), ...(message.caption !== undefined ? { caption: message.caption } : {}), media };
+	}
+	async function loadConfig(): Promise<TelegramConfig> {
+		if (leaseUncertain || profileLease?.retired) throw new Error("Telegram lease ownership uncertain; operator repair required");
+		try { return await readConfig(); }
+		catch { inboxFault = true; throw new Error("Telegram configuration invalid; operator repair required"); }
+	}
+	async function commitConfig(next: TelegramConfig): Promise<void> {
+		ensureLease();
+		try { await persistTelegramConfig(CONFIG_PATH, next); }
+		catch { inboxFault = true; throw new Error("Telegram configuration persistence failed; operator repair required"); }
+		config = next; // ONLY after file and directory flush.
+	}
+
 
 	// Diagnostics contain only fixed labels, counts, booleans and times. No content
 	// or external error strings; never persisted or used to make routing decisions.
@@ -431,12 +546,12 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		const hostIdle = ctx.isIdle(), hostPending = ctx.hasPendingMessages();
 		const state = phases();
-		const blocker = closed ? "closed" : recoveryRequired ? "recovery-required" : reloadPending ? "reload-pending" :
+		const blocker = closed ? "closed" : inboxFault ? "admission-repair-required" : coldIncoming.size ? "interrupted-inbox" : recoveryRequired ? "recovery-required" : reloadPending ? "reload-pending" :
 			restoredDisconnected ? "restored-disconnected" : failedPreparations.length || failedIngress.length ? "failed-ingress-or-preparation" : state.preflight ? "preflight" : state.held ? "held" :
 			state.submitted ? "submitted" : state.active ? "active-awaiting-settlement" :
 			state.finalizing ? "finalizing" : !hostIdle ? "host-busy" : hostPending ? "host-pending" :
 			queuedTelegramTurns.length ? "awaiting-drain" : state.preparing ? "preparing" : "none";
-		return { instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
+		return { admission: { open: !!inbox, fault: inboxFault, live: liveIncoming.size, interrupted: coldIncoming.size, lease: !!profileLease && !profileLease.retired, leaseUncertain }, instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
 			queued: queuedTelegramTurns.length, ...state, preparationCount,
 			reloadPending, recoveryRequired, restoredDisconnected, uncertainReply: !!uncertainReply,
 			failedPreparations: failedPreparations.length, failedIngress: failedIngress.length,
@@ -480,6 +595,10 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("error", "error")} ${theme.fg("muted", error)}`);
 			return;
 		}
+		if (inboxFault || coldIncoming.size) {
+			ctx.ui.setStatus("telegram", `${label} ${theme.fg("warning", inboxFault ? "operator repair required" : "interrupted inbox; local reconciliation required")}`);
+			return;
+		}
 		if (!config.botToken) {
 			ctx.ui.setStatus("telegram", `${label} ${theme.fg("muted", "not configured")}`);
 			return;
@@ -505,8 +624,10 @@ export default function (pi: ExtensionAPI) {
 		body: Record<string, unknown>,
 		options?: { signal?: AbortSignal },
 	): Promise<TResponse> {
-		if (closed) throw new Error("Telegram session shut down");
+		ensureLease();
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
+		apiCalls++;
+		try {
 		const response = await fetch(`https://api.telegram.org/bot${config.botToken}/${method}`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
@@ -515,9 +636,11 @@ export default function (pi: ExtensionAPI) {
 		});
 			const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
+			throw new Error("Telegram API request failed");
 		}
 		return data.result;
+		} catch { throw new Error("Telegram API request unavailable"); }
+		finally { apiCalls--; maybeReleaseLease(); }
 	}
 
 	// Optional UI operations never join ingress/preparation/finalization barriers.
@@ -567,6 +690,7 @@ export default function (pi: ExtensionAPI) {
 	): Promise<TResponse> {
 		if (closed) throw new Error("Telegram session shut down");
 		if (!config.botToken) throw new Error("Telegram bot token is not configured");
+		ensureLease();
 		const form = new FormData();
 		for (const [key, value] of Object.entries(fields)) {
 			form.set(key, value);
@@ -581,7 +705,7 @@ export default function (pi: ExtensionAPI) {
 		});
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
+			throw new Error("Telegram API request failed");
 		}
 		return data.result;
 	}
@@ -610,8 +734,7 @@ export default function (pi: ExtensionAPI) {
 			try {
 				await callTelegram("sendChatAction", { chat_id: targetChatId, action: "typing" });
 			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
-				updateStatus(ctx, `typing failed: ${message}`);
+				updateStatus(ctx, "Telegram typing unavailable");
 			}
 		};
 
@@ -771,7 +894,8 @@ export default function (pi: ExtensionAPI) {
 		return messageId === undefined ? {} : { reply_parameters: { message_id: messageId } };
 	}
 
-	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<void> {
+	async function sendQueuedAttachments(turn: ActiveTelegramTurn): Promise<boolean> {
+		let success = true;
 		for (const attachment of turn.queuedAttachments) {
 			try {
 				const mediaType = guessMediaType(attachment.path);
@@ -788,11 +912,13 @@ export default function (pi: ExtensionAPI) {
 					attachment.fileName,
 				);
 			} catch (error) {
+				success = false;
 				uncertainReply = turn;
 				const message = error instanceof Error ? error.message : String(error);
 				await sendTextReply(turn.chatId, turn.replyToMessageId, `Failed to send attachment ${attachment.fileName}: ${message}`, continuationReplyTo(turn) !== undefined);
 			}
 		}
+		return success;
 	}
 
 	function extractAssistantText(messages: AgentMessage[]): { text?: string; stopReason?: string; errorMessage?: string } {
@@ -836,6 +962,7 @@ export default function (pi: ExtensionAPI) {
 					isImage: isImageMimeType(message.document.mime_type),
 				});
 			}
+			if (message.video_note) files.push({ file_id: message.video_note.file_id, fileName: `video-note-${message.message_id}.mp4`, mimeType: "video/mp4", isImage: false });
 			if (message.video) {
 				const fileName = message.video.file_name || `video-${message.message_id}${guessExtensionFromMime(message.video.mime_type, ".mp4")}`;
 				files.push({
@@ -893,34 +1020,42 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
-		if (!ctx.hasUI || setupInProgress || reloadPending) return;
+		if (closed || inboxFault || recoveryRequired || !ctx.hasUI || setupInProgress || reloadPending) return;
+		ensureLease();
+		if (liveIncoming.size || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || failedIngress.length || failedPreparations.length) {
+			ctx.ui.notify("Telegram setup refused: live ownership must quiesce first.", "error"); return;
+		}
 		setupInProgress = true;
 		try {
 			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
-			if (!token) return;
+			if (!token || closed) return;
+			await stopPolling();
+			if (closed || liveIncoming.size || preparationCount || queuedTelegramTurns.length) throw new Error("Telegram setup refused: ingress ownership changed");
 
 			const nextConfig: TelegramConfig = { ...config, botToken: token.trim() };
 			const response = await fetch(`https://api.telegram.org/bot${nextConfig.botToken}/getMe`);
 			const data = (await response.json()) as TelegramApiResponse<TelegramUser>;
 			if (!data.ok || !data.result) {
-				ctx.ui.notify(data.description || "Invalid Telegram bot token", "error");
+				ctx.ui.notify("Invalid or unavailable Telegram bot identity", "error");
 				return;
 			}
 
+			if (closed) return;
 			nextConfig.botId = data.result.id;
 			nextConfig.botUsername = data.result.username;
 			identityController?.abort();
 			identityController = undefined;
 			verifiedUsername = undefined;
 			verifiedToken = undefined;
-			config = nextConfig;
-			await writeConfig(config);
+			await commitConfig(nextConfig);
+			openInbox();
 			ctx.ui.notify(`Telegram bot connected: @${config.botUsername ?? "unknown"}`, "info");
 			ctx.ui.notify("Send /start to your bot in Telegram to pair this extension with your account.", "info");
 			await startPolling(ctx);
 			updateStatus(ctx);
 		} finally {
 			setupInProgress = false;
+			maybeReleaseLease();
 			drainTelegramQueue(ctx);
 		}
 	}
@@ -999,6 +1134,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		return {
+			incomingIds: [...historyTurns.flatMap(turn => turn.incomingIds ?? []), ...messageIncomingIds(messages)],
 			marker,
 			chatId: firstMessage.chat.id,
 			replyToMessageId: firstMessage.message_id,
@@ -1011,10 +1147,7 @@ export default function (pi: ExtensionAPI) {
 	async function dispatchAuthorizedTelegramMessages(messages: TelegramMessage[], ctx: ExtensionContext, intent: number): Promise<void> {
 		const firstMessage = messages[0];
 		if (closed || !firstMessage) return;
-		const standalone = messages.length === 1 && typeof firstMessage.text === "string" &&
-			!firstMessage.caption && !firstMessage.media_group_id && !firstMessage.photo && !firstMessage.document &&
-			!firstMessage.video && !firstMessage.audio && !firstMessage.voice && !firstMessage.animation && !firstMessage.sticker;
-		const command = standalone ? parseTelegramCommand(firstMessage.text!, verifiedToken === config.botToken ? verifiedUsername : undefined) : undefined;
+		const command = messages.length === 1 ? telegramControl(firstMessage) : undefined;
 		// Cursor acceptance survives disconnect for ordinary input, not controls.
 		// Handoff's internal poll abort does NOT change this explicit intent.
 		if (command && intent !== connectionIntent) return;
@@ -1050,11 +1183,8 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (lower === "/stop") {
-			preserveQueuedTurnsAsHistory = true;
-			transition("stop-held");
-			stopGeneration++;
+			// Stop intent and local safety effects already precede cursor persistence.
 			if (currentAbort) {
-				currentAbort();
 				updateStatus(ctx);
 				await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Aborted current turn.");
 			} else {
@@ -1166,6 +1296,8 @@ export default function (pi: ExtensionAPI) {
 				? queuedTelegramTurns.filter((turn) => turn !== submittedTelegramTurn) : [];
 			const turn = await createTelegramTurn(messages, historyTurns);
 			if (closed) return;
+			journalTurn(turn, arrivalGeneration === stopGeneration && !coldIncoming.size ? "queued" : "held");
+			if (arrivalGeneration === stopGeneration) inbox?.clearStopLatch();
 			queuedTelegramTurns = queuedTelegramTurns.filter((queued) => !historyTurns.includes(queued));
 			// A download begun before /stop must never release its hold.
 			if (arrivalGeneration === stopGeneration) preserveQueuedTurnsAsHistory = false;
@@ -1176,10 +1308,11 @@ export default function (pi: ExtensionAPI) {
 			drainTelegramQueue(ctx);
 		});
 		preparingTurns = preparing.catch(() => {
+			if (closed) return;
 			transition("preparation-failed");
 			failedPreparations.push(structuredClone(messages));
 			updateStatus(ctx, "attachment preparation failed; work retained, dispatch blocked");
-		}).finally(() => { preparationCount--; transition("preparation-finished"); });
+		}).finally(() => { preparationCount--; transition("preparation-finished"); maybeReleaseLease(); });
 	}
 
 	function drainTelegramQueue(ctx: ExtensionContext): void {
@@ -1210,7 +1343,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function canSubmitTelegramTurn(ctx: ExtensionContext): boolean {
-		return !(closed || reloadPending || restoredDisconnected || failedPreparations.length || failedIngress.length || preflightPending || preserveQueuedTurnsAsHistory || submittedTelegramTurn || activeTelegramTurn || finalizingReply ||
+		return !(closed || inboxFault || coldIncoming.size || recoveryRequired || reloadPending || restoredDisconnected || failedPreparations.length || failedIngress.length || preflightPending || preserveQueuedTurnsAsHistory || submittedTelegramTurn || activeTelegramTurn || finalizingReply ||
 			!ctx.isIdle() || ctx.hasPendingMessages());
 	}
 
@@ -1268,6 +1401,8 @@ export default function (pi: ExtensionAPI) {
 			if (originReady(ctx)) pi.events.emit(ORIGIN_READY, { provider: "telegram", version: 1 });
 			return;
 		}
+		try { journalTurn(turn, "dispatching"); }
+		catch { updateStatus(ctx, "admission dispatch blocked; operator repair required"); return; }
 		submittedTelegramTurn = turn;
 		transition("submitted");
 		updateStatus(ctx);
@@ -1275,9 +1410,12 @@ export default function (pi: ExtensionAPI) {
 			pi.sendUserMessage(turn.content);
 		} catch (error) {
 			// A synchronous rejection did not accept the turn. Keep it in FIFO order.
-			if (submittedTelegramTurn === turn) submittedTelegramTurn = undefined;
+			if (turn.incomingIds?.length) {
+				uncertainReply = turn;
+				try { journalTurn(turn, "uncertain"); } catch { /* fault already latched */ }
+			} else if (submittedTelegramTurn === turn) submittedTelegramTurn = undefined;
 			transition("submission-sync-rejected");
-			updateStatus(ctx, `submission failed: ${String(error)}`);
+			updateStatus(ctx, "submission failed; outcome uncertain, inspect locally");
 		}
 	}
 
@@ -1305,24 +1443,81 @@ export default function (pi: ExtensionAPI) {
 		await dispatchAuthorizedTelegramMessages([message], ctx, intent);
 	}
 
+	function localSafetyStop(ctx: ExtensionContext): void {
+		preserveQueuedTurnsAsHistory = true;
+		stopGeneration++;
+		transition("stop-held");
+		currentAbort?.();
+		updateStatus(ctx);
+	}
+
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext, intent: number, signal: AbortSignal): Promise<void> {
-		const message = update.message || update.edited_message;
-		if (!message || message.business_connection_id || message.guest_query_id || message.chat.type !== "private" || !message.from || message.from.is_bot) return;
-
-		if (config.allowedUserId === undefined) {
-			config.allowedUserId = message.from.id;
-			await writeConfig(config);
-			updateStatus(ctx);
-			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
+		if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) throw new Error("Invalid Telegram update identity");
+		if (config.lastUpdateId !== undefined && update.update_id <= config.lastUpdateId) {
+			const prior = inbox?.inspect().records.find(record => record.updateId === update.update_id);
+			const message = update.message || update.edited_message;
+			if (prior?.input && message && message.from?.id === config.allowedUserId) {
+				const input = admissionDTO(update, message, ctx);
+				inbox!.admit({ ...input, sessionId: prior.input.sessionId, epoch: prior.input.epoch, receivedAt: prior.input.receivedAt });
+			}
+			return; // Confirmed durable cursor permits ignoring compacted/pruned IDs.
 		}
-
-		if (message.from.id !== config.allowedUserId) {
-			await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
+		const message = update.message || update.edited_message;
+		const eligible = message && !message.business_connection_id && !message.guest_query_id && message.chat.type === "private" && message.from && !message.from.is_bot;
+		const authorized = eligible && (config.allowedUserId === undefined || message.from!.id === config.allowedUserId);
+		const command = authorized ? telegramControl(message) : undefined;
+		const safetyStop = authorized && command?.name === "stop" && command.args === "" && !command.foreign &&
+			!retainedIncoming.has(update.update_id) && !closed && intent === connectionIntent && !signal.aborted;
+		let stopped = false;
+		let admitted = false;
+		const paired = authorized && config.allowedUserId === undefined;
+		try {
+			if (authorized) {
+				openInbox(message.from!.id);
+				if (config.lastUpdateId !== undefined) inbox!.prune(config.lastUpdateId);
+				const input = admissionDTO(update, message, ctx);
+				const prior = inbox!.inspect().records.find(record => record.updateId === update.update_id);
+				if (prior?.input) {
+					input.sessionId = prior.input.sessionId; input.epoch = prior.input.epoch; input.receivedAt = prior.input.receivedAt;
+				} else if (prior) throw new Error("Telegram cursor disagrees with compacted admission");
+				admitted = inbox!.admit(input).admitted;
+				retainedIncoming.add(update.update_id);
+				if (admitted) liveIncoming.add(update.update_id);
+				if (admitted && safetyStop) {
+					inbox!.stop([...liveIncoming].filter(id => id !== update.update_id));
+					stopped = true; localSafetyStop(ctx);
+				}
+				messageIds.set(message, update.update_id);
+			}
+			await commitConfig({ ...config, ...(paired ? { allowedUserId: message!.from!.id } : {}), lastUpdateId: update.update_id });
+		} catch (error) {
+			if (safetyStop && !closed && intent === connectionIntent && !signal.aborted) {
+				inboxFault = true;
+				if (!stopped) localSafetyStop(ctx);
+				updateStatus(ctx, "stop applied locally; persistence uncertain, operator repair required");
+			}
+			throw error;
+		}
+		if (!authorized) {
+			if (eligible && message) await sendTextReply(message.chat.id, message.message_id, "This bot is not authorized for your account.");
 			return;
 		}
-
+		for (const id of retainedIncoming) if (id <= config.lastUpdateId!) retainedIncoming.delete(id);
+		if (!admitted) return; // Retained duplicates NEVER repeat effects.
+		if (closed) return;
+		if (paired) {
+			updateStatus(ctx);
+			ctx.ui.notify("Telegram bridge paired with this account.", "info");
+			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
+		}
 		syncCommandMenu(message.chat.id, intent, signal);
 		await handleAuthorizedTelegramMessage(message, ctx, intent);
+		// Ordinary messages remain live through async preparation/finalization.
+		// All standalone command paths return after local control handling only.
+		if (!closed && telegramControl(message)) {
+			journalTurn({ incomingIds: [update.update_id], marker: `control:${update.update_id}` } as PendingTelegramTurn, "handled");
+		}
+		if (!closed) inbox!.prune(config.lastUpdateId!);
 	}
 
 	async function pollLoop(ctx: ExtensionContext, signal: AbortSignal, intent: number): Promise<void> {
@@ -1338,10 +1533,11 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const updates = await callTelegram<TelegramUpdate[]>("getUpdates", { offset: -1, limit: 1, timeout: 0 }, { signal });
 				const last = updates.at(-1);
-				config.lastUpdateId = last?.update_id ?? 0;
-				await writeConfig(config);
+				await commitConfig({ ...config, lastUpdateId: last?.update_id ?? 0 });
 			} catch {
-				// ignore
+				inboxFault = true;
+				updateStatus(ctx, "cursor initialization failed; operator repair required");
+				return;
 			}
 		}
 
@@ -1360,19 +1556,21 @@ export default function (pi: ExtensionAPI) {
 				for (const update of updates) {
 					if (closed || signal.aborted) return;
 					try {
-						config.lastUpdateId = update.update_id;
-						await writeConfig(config);
 						await handleUpdate(update, ctx, intent, signal);
 					} catch (error) {
-						failedIngress.push(update);
-						throw error;
+						if (!closed && config.lastUpdateId !== undefined && config.lastUpdateId >= update.update_id && liveIncoming.has(update.update_id)) {
+							try { journalTurn({ incomingIds: [update.update_id], marker: `ingress:${update.update_id}` } as PendingTelegramTurn, "uncertain"); } catch { /* retain fault */ }
+						}
+						failedIngress.push({ updateId: Number.isSafeInteger(update.update_id) ? update.update_id : undefined });
+						inboxFault = true;
+						updateStatus(ctx, "admission interrupted; operator repair required");
+						return;
 					}
 				}
 			} catch (error) {
 				if (signal.aborted) return;
 				if (error instanceof DOMException && error.name === "AbortError") return;
-				const message = error instanceof Error ? error.message : String(error);
-				updateStatus(ctx, message);
+				updateStatus(ctx, "Telegram polling unavailable");
 				await new Promise<void>((resolve) => {
 					const done = () => { clearTimeout(timer); signal.removeEventListener("abort", done); resolve(); };
 					const timer = setTimeout(done, 3000);
@@ -1384,7 +1582,13 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
-		if (closed || reloadPending || !config.botToken || pollingPromise) return;
+		if (closed || inboxFault || reloadPending || !config.botToken || pollingPromise) return;
+		try {
+			ensureLease();
+			if ((config.lastUpdateId === undefined || config.allowedUserId === undefined) && readdirSync(inboxRoot!).some(name => name !== `${digest(["pi-telegram/profile-writer/v1"])}.lock`))
+				throw new Error("Telegram cursor or pairing missing over existing inbox");
+			openInbox();
+		} catch { inboxFault = true; updateStatus(ctx, "inbox unavailable; operator repair required"); return; }
 		// A failed, quiesced handoff may retain identity for its drained ingress.
 		// Starting another connection always requires a fresh verification.
 		verifiedUsername = undefined;
@@ -1410,7 +1614,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function refuseReload(ctx: ExtensionContext): boolean {
-		if (uncertainReply || submittedTelegramTurn || preflightPending || failedPreparations.length || failedIngress.length || setupInProgress) {
+		if (inboxFault || coldIncoming.size || uncertainReply || submittedTelegramTurn || preflightPending || failedPreparations.length || failedIngress.length || setupInProgress) {
 			ctx.ui.notify("Telegram reload refused: unacknowledged/preflight, uncertain reply, or failed preparation work. Preserve affected messages before ordinary teardown; no automatic replay.", "error");
 			return true;
 		}
@@ -1474,14 +1678,15 @@ export default function (pi: ExtensionAPI) {
 				if (intent !== connectionIntent) throw new Error("connection intent changed");
 				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
 					throw new Error("not safe after quiescing");
-				const diskConfig = await readConfig();
+				const diskConfig = await loadConfig();
 				if (configDigest(diskConfig) !== configDigest(config) || diskConfig.lastUpdateId !== config.lastUpdateId) throw new Error("config changed");
 				if (closed) return;
 				if (intent !== connectionIntent) throw new Error("connection intent changed");
 				// No async work between this final admission check and snapshot/reload.
 				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
 					throw new Error("not safe after config verification");
-				checkpoint = structuredClone({ version: 1, reason: "telegram-reload", nonce: randomUUID(), sessionId, sessionFile,
+				const snapshot = inbox?.inspect();
+				checkpoint = structuredClone({ ...(snapshot ? { admission: { scope: snapshot.scope, generation: snapshot.generation, stopLatched: snapshot.stopLatched } } : {}), version: 1, reason: "telegram-reload", nonce: randomUUID(), sessionId, sessionFile,
 					configDigest: configDigest(config), bridgeEpoch, connected, cursor: config.lastUpdateId,
 					held: preserveQueuedTurnsAsHistory, stopGeneration, turns: queuedTelegramTurns });
 				// Bound session growth; never silently truncate private text or image inputs.
@@ -1617,10 +1822,56 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("telegram-inbox", {
+		description: "Local-only retained inbox: summary, show ID, acknowledge ID (reason + confirmation; never replay)",
+		handler: async (args, ctx) => {
+			if (closed || !ctx.hasUI || ctx.mode !== "tui") return;
+			try {
+				ensureLease(); openInbox();
+				if (!inbox || inboxFault || recoveryRequired) throw new Error("repair required");
+				const [action = "summary", idText, ...extra] = args.trim().split(/\s+/).filter(Boolean);
+				const snapshot = inbox.inspect();
+				if (action === "summary" && !idText) {
+					ctx.ui.notify(JSON.stringify({ scope: snapshot.scope, revision: snapshot.generation, stopLatched: snapshot.stopLatched,
+						interrupted: coldIncoming.size, live: liveIncoming.size,
+						records: snapshot.records.map(record => ({ id: record.updateId, phase: record.phase, live: liveIncoming.has(record.updateId) })) }), "info"); return;
+				}
+				if (!idText || !/^\d+$/.test(idText) || (action !== "show" && extra.length)) throw new Error("invalid selection");
+				const id = Number(idText), record = snapshot.records.find(record => record.updateId === id);
+				if (!record) throw new Error("missing record");
+				if (action === "show") {
+					// JSON quoting prevents terminal control injection. This notification is
+					// not a host/model message or a Telegram reply.
+					const page = extra[0] ?? "0";
+					if (extra.length > 1 || !/^\d{1,6}$/.test(page)) throw new Error("invalid page");
+					const quoted = JSON.stringify(record).replace(/[\x7f-\uffff]/g, char => `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`);
+					const pages = Math.ceil(quoted.length / 4096), offset = Number(page) * 4096;
+					if (offset >= quoted.length) throw new Error("invalid page");
+					ctx.ui.notify(`Retained record page ${page}/${pages - 1} (quoted): ${quoted.slice(offset, offset + 4096)}\nInspect ALL pages locally with /telegram-inbox show ${id} PAGE before ACK. Media references only: no durable attachment bytes or availability guarantee.`, "info"); return;
+				}
+				if (action !== "acknowledge" || liveIncoming.has(id) || !coldIncoming.has(id) || terminalPhase(record.phase)) throw new Error("live or ineligible");
+				const reason = (await ctx.ui.input("Local reconciliation reason (required; no replay)", "How was this interrupted input resolved?"))?.trim();
+				if (!reason || Buffer.byteLength(reason) > 1024 || /[\x00-\x1f\x7f-\x9f]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/u.test(reason)) return;
+				if (closed) return;
+				const confirmed = await ctx.ui.confirm("Acknowledge interrupted Telegram input?",
+					`Scope ${snapshot.scope}, update ${id}. Records a manual local disposition only; NEVER submits old records. Resolving the last interrupted record may unblock NEW current-process queued messages, not this old input. The stop latch remains unchanged. Media is reference-only.`);
+				if (!confirmed || closed) return;
+				if (!profileLease || !inbox || inboxFault || recoveryRequired || inbox.inspect().scope !== snapshot.scope || liveIncoming.has(id) || !coldIncoming.has(id) ||
+					JSON.stringify(inbox.inspect().records.find(record => record.updateId === id)) !== JSON.stringify(record)) throw new Error("selection changed");
+				inbox.acknowledge(id, { at: Date.now(), note: reason });
+				coldIncoming.delete(id);
+				updateStatus(ctx);
+				ctx.ui.notify("Interrupted input acknowledged locally. No old input replayed.", "info");
+				drainTelegramQueue(ctx);
+			} catch { if (!closed) ctx.ui.notify("Telegram inbox refused: unavailable, live ownership, invalid selection or operator repair required. No replay or reset performed.", "error"); }
+		},
+	});
+
 	pi.registerCommand("telegram-setup", {
 		description: "Configure Telegram bot token",
 		handler: async (_args, ctx) => {
-			await promptForConfig(ctx);
+			try { await promptForConfig(ctx); }
+			catch { if (!closed) ctx.ui.notify("Telegram setup refused; inspect profile ownership/configuration locally.", "error"); }
 		},
 	});
 
@@ -1631,7 +1882,7 @@ export default function (pi: ExtensionAPI) {
 			const snapshot = diagnostics(ctx);
 			const { instance, loadedAt, configured, paired, polling, blocker, queued, submitted, preflight, active, finalizing,
 				held, settlementOwed, finalizationStage, hostIdle, hostPending, agesMs } = snapshot;
-			const view = args.trim() === "detail" ? snapshot : { instance, loadedAt, configured, paired, polling, blocker, queued,
+			const view = args.trim() === "detail" ? snapshot : { admission: snapshot.admission, instance, loadedAt, configured, paired, polling, blocker, queued,
 				submitted, preflight, active, finalizing, held, settlementOwed, finalizationStage,
 				hostIdle, hostPending, agesMs };
 			const status = Object.entries(view).map(([key, value]) =>
@@ -1646,11 +1897,17 @@ export default function (pi: ExtensionAPI) {
 	pi.registerCommand("telegram-connect", {
 		description: "Start the Telegram bridge in this pi session",
 		handler: async (_args, ctx) => {
-			if (reloadPending || recoveryRequired) {
+			if (pollingPromise || setupInProgress) return;
+			if (reloadPending || recoveryRequired || inboxFault) {
 				ctx.ui.notify("Telegram handoff pending or recovery required; inspect the retained session checkpoint before any reconnect.", "error");
 				return;
 			}
-			config = await readConfig();
+			ensureLease();
+			const next = await loadConfig();
+			if ((configDigest(next) !== configDigest(config) || next.lastUpdateId !== config.lastUpdateId) && (liveIncoming.size || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || pollingPromise)) {
+				ctx.ui.notify("Telegram identity change refused: live ownership.", "error"); return;
+			}
+			config = next;
 			if (!config.botToken) {
 				await promptForConfig(ctx);
 				return;
@@ -1667,6 +1924,7 @@ export default function (pi: ExtensionAPI) {
 			restoredDisconnected = true;
 			if (reservation) { reservation = undefined; releaseUnstartedReload(ctx); }
 			await stopPolling();
+			maybeReleaseLease();
 			updateStatus(ctx);
 		},
 	});
@@ -1679,7 +1937,7 @@ export default function (pi: ExtensionAPI) {
 		if (restoreStarted) return;
 		restoreStarted = true;
 		if (event.reason !== "reload") {
-			config = await readConfig();
+			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			updateStatus(ctx);
 			return;
@@ -1687,7 +1945,7 @@ export default function (pi: ExtensionAPI) {
 		const entries = ctx.sessionManager.getEntries();
 		const entry = [...entries].reverse().find(e => e.type === "custom" && e.customType === CHECKPOINT_TYPE);
 		if (!entry || entry.type !== "custom") {
-			config = await readConfig();
+			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			updateStatus(ctx);
 			return;
@@ -1701,7 +1959,7 @@ export default function (pi: ExtensionAPI) {
 			saved.version !== 1 || saved.reason !== "telegram-reload" || saved.sessionId !== ctx.sessionManager.getSessionId() ||
 			saved.sessionFile !== ctx.sessionManager.getSessionFile() ||
 			entries.some(e => e.type === "custom" && e.customType === CLAIM_TYPE && (e.data as { nonce?: string })?.nonce === saved.nonce)) {
-			config = await readConfig();
+			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			updateStatus(ctx);
 			ctx.ui.notify("No valid live Telegram reload handoff; disconnected. Any archived checkpoint remains private session data, not permission to replay it.", "info");
@@ -1711,11 +1969,27 @@ export default function (pi: ExtensionAPI) {
 		recoveryRequired = true;
 		try {
 			pi.appendEntry(CLAIM_TYPE, { nonce: saved.nonce });
-			config = await readConfig();
+			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			if (saved.configDigest !== configDigest(config) || saved.cursor !== config.lastUpdateId) throw new Error("config mismatch");
 			if (saved.bridgeEpoch !== undefined && !validEpoch(saved.bridgeEpoch)) throw new Error("invalid bridge epoch");
 			if (saved.bridgeEpoch !== undefined) bridgeEpoch = saved.bridgeEpoch;
+			ensureLease(); openInbox();
+			const snapshot = inbox?.inspect();
+			if (saved.admission) {
+				if (!snapshot || saved.admission.scope !== snapshot.scope || saved.admission.generation !== snapshot.generation || saved.admission.stopLatched !== snapshot.stopLatched || saved.held !== snapshot.stopLatched) throw new Error("journal disagreement");
+				const ids = saved.turns.flatMap(turn => turn.incomingIds ?? []);
+				if (new Set(ids).size !== ids.length) throw new Error("duplicate checkpoint ownership");
+				for (const turn of saved.turns) for (const id of turn.incomingIds ?? []) {
+					const record = snapshot.records.find(record => record.updateId === id);
+					if (!record?.input || !["queued", "held"].includes(record.phase) || record.turnMarker !== turn.marker || record.input.sessionId !== saved.sessionId || record.input.epoch !== bridgeEpoch) throw new Error("checkpoint ownership disagreement");
+				}
+				for (const id of ids) { coldIncoming.delete(id); liveIncoming.add(id); }
+			} else {
+				if (saved.turns.some(turn => turn.incomingIds?.length) || snapshot?.records.some(record => !terminalPhase(record.phase))) throw new Error("legacy checkpoint disagrees with journal");
+				if (saved.held && inbox && !snapshot?.stopLatched) inbox.stop([]);
+				ctx.ui.notify("Legacy same-process handoff: retained turns are not newly journal-protected.", "warning");
+			}
 			queuedTelegramTurns = structuredClone(saved.turns);
 			// Diagnostic clocks restart in this instance, not at original arrival.
 			const restoredAt = Date.now();
@@ -1747,6 +2021,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (event, _ctx) => {
+		if (closed) { maybeReleaseLease(); return; }
 		if (checkpoint) {
 			const permit = reloadState.permits.get(checkpoint.nonce);
 			if (permit) permit.armed = event.reason === "reload";
@@ -1778,6 +2053,7 @@ export default function (pi: ExtensionAPI) {
 		currentAbort = undefined;
 		preserveQueuedTurnsAsHistory = false;
 		await stopPolling();
+		maybeReleaseLease();
 	});
 
 	pi.on("before_agent_start", async (event, ctx) => {
@@ -1786,6 +2062,13 @@ export default function (pi: ExtensionAPI) {
 		const turn = submittedTelegramTurn;
 		routingTelegram = !!turn && event.prompt.includes(turn.marker);
 		if (routingTelegram && turn) {
+			try { journalTurn(turn, "active"); }
+			catch {
+				// Host proceeds after this hook, even on error. Retain volatile routing.
+				uncertainReply = turn;
+				preserveQueuedTurnsAsHistory = true;
+				updateStatus(ctx, "admission active marker failed; routing retained, operator repair required");
+			}
 			submittedTelegramTurn = undefined;
 			queuedTelegramTurns.splice(queuedTelegramTurns.indexOf(turn), 1);
 			activeTelegramTurn = turn;
@@ -1886,15 +2169,18 @@ export default function (pi: ExtensionAPI) {
 		transition("finalization-start");
 		updateStatus(ctx);
 		let replyError: string | undefined;
+		let localSuccess = false;
 		try {
 			const assistant = lastTelegramAssistant;
 			if (assistant.stopReason === "aborted") {
 				await clearPreview(turn.chatId);
+				localSuccess = true; // Local abort handling, not request completion.
 				return;
 			}
 			if (assistant.stopReason === "error") {
 				await clearPreview(turn.chatId);
 				await sendTextReply(turn.chatId, turn.replyToMessageId, assistant.errorMessage || "Telegram bridge: pi failed while processing the request.", continuationReplyTo(turn) !== undefined);
+				localSuccess = true; // Error report locally finalized, not goal completion.
 				return;
 			}
 
@@ -1916,16 +2202,23 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			finalizationStage = "attachments";
-			await sendQueuedAttachments(turn);
+			localSuccess = await sendQueuedAttachments(turn);
+			if (!localSuccess) replyError = "attachment delivery failed; outcome uncertain, inspect locally";
 
 		} catch (error) {
 			uncertainReply = turn;
 			transition("finalization-failed");
-			replyError = `reply failed: ${String(error)}`;
+			replyError = "reply failed; outcome uncertain, inspect locally";
 		} finally {
 			finalizationStage = "preview-cleanup";
-			await clearPreview(turn.chatId);
+			try {
+				await clearPreview(turn.chatId);
+				if (!closed) journalTurn(turn, localSuccess ? "handled" : "uncertain");
+				if (!localSuccess && turn.incomingIds?.length) uncertainReply = turn;
+				else if (localSuccess && uncertainReply === turn) uncertainReply = undefined;
+			} catch { uncertainReply = turn; inboxFault = true; }
 			finalizingReply = false;
+			maybeReleaseLease();
 			for (const resolve of replyWaiters.splice(0)) resolve();
 			finalizationStage = "none";
 			transition("finalization-finished");
