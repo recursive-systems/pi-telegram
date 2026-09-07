@@ -21,8 +21,8 @@ export async function harness(t, options = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const home = await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
   leaseBoundary.roots.add(join(home, '.pi/agent/telegram-inbox'));
-  const oldHome = process.env.HOME;
-  process.env.HOME = home;
+  const oldHome = process.env.HOME, oldTmp = process.env.TMPDIR;
+  process.env.HOME = home; process.env.TMPDIR = home;
   await mkdir(join(home, '.pi/agent'), { recursive: true });
   await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0, ...options.config }));
   let configWrite = async () => {}, pollSignal;
@@ -264,7 +264,7 @@ export async function harness(t, options = {}) {
     attach: paths => tools.get('telegram_attach').execute('call', { paths }),
     async shutdown() { await emit('session_shutdown'); },
   };
-  t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; leaseBoundary.roots.delete(join(home, '.pi/agent/telegram-inbox')); await rm(home, { recursive: true, force: true }); });
+  t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; process.env.TMPDIR = oldTmp; leaseBoundary.roots.delete(join(home, '.pi/agent/telegram-inbox')); await rm(home, { recursive: true, force: true }); });
   await instantiate();
   await emit('session_start', { reason: options.sessionReason ?? 'startup' });
   if (options.connected !== false) {

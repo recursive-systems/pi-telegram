@@ -20,6 +20,26 @@ const args = ['-I', '-S', '-c', 'import fcntl,sys\ntry: fcntl.flock(3,fcntl.LOCK
 export function boundary(realOS = false) {
   assert.ok(process.env.HOME && process.env.TMPDIR, 'private scratch HOME and TMPDIR required');
   assert.equal(fs.realpathSync(process.env.HOME), fs.realpathSync(process.env.TMPDIR));
+  // Independent test identity, never imported from production or an executable
+  // passthrough list. Only the OS group may run this one pinned inode/argv.
+  let python;
+  if (realOS) {
+    const candidates = process.env.PI_TELEGRAM_PYTHON !== undefined
+      ? [process.env.PI_TELEGRAM_PYTHON]
+      : (process.env.PATH ?? '').split(path.delimiter).filter(p => path.isAbsolute(p)).map(p => path.join(p, 'python3'));
+    assert.ok(candidates.length <= 128);
+    python = candidates.find(p => {
+      assert.ok(path.isAbsolute(p) && Buffer.byteLength(p) <= 4096 && !/[\x00-\x1f\x7f]/.test(p));
+      try { fs.accessSync(p, fs.constants.X_OK); return fs.statSync(p).isFile(); } catch { return false; }
+    });
+    assert.ok(python, 'OS suite requires Python3 with stdlib fcntl; set PI_TELEGRAM_PYTHON');
+  } else {
+    const bin = fs.mkdtempSync(path.join(fs.realpathSync(process.env.HOME), 'fake-interpreter-'));
+    python = path.join(bin, 'python3');
+    fs.writeFileSync(python, 'NOT AN EXECUTABLE PROGRAM\n', { mode: 0o700 });
+  }
+  process.env.PI_TELEGRAM_PYTHON = python;
+  const pythonIdentity = fs.statSync(python);
   const realExec = cp.execFileSync;
   const realClose = fs.closeSync;
   const realOpen = fs.openSync;
@@ -49,12 +69,14 @@ export function boundary(realOS = false) {
       assert.deepEqual(actualArgs, ownerArgs);
       assert.deepEqual(Object.keys(options).sort(), ['cwd', 'env', 'stdio', 'timeout']);
       assert.ok(roots.has(options.env.HOME), 'child HOME must be a registered scratch root');
-      assert.deepEqual(options.env, { HOME: options.env.HOME, TMPDIR: options.env.HOME });
+      assert.deepEqual(options.env, { HOME: options.env.HOME, TMPDIR: options.env.HOME, PI_TELEGRAM_PYTHON: python });
       assert.equal(options.cwd, '/'); assert.equal(options.timeout, 3000);
       assert.deepEqual(options.stdio, ['ignore', 'ignore', 'ignore']);
       return realExec(executable, actualArgs, options);
     }
-    assert.equal(executable, '/usr/bin/python3'); assert.deepEqual(actualArgs, args);
+    assert.equal(executable, python);
+    const identity = fs.statSync(python);
+    assert.equal(identity.dev, pythonIdentity.dev); assert.equal(identity.ino, pythonIdentity.ino); assert.deepEqual(actualArgs, args);
     assert.deepEqual(Object.keys(options).sort(), ['cwd', 'env', 'stdio', 'timeout']);
     assert.deepEqual(options.env, { LANG: 'C', LC_ALL: 'C' });
     assert.equal(options.cwd, '/'); assert.equal(options.timeout, 3000);
@@ -84,12 +106,12 @@ export function boundary(realOS = false) {
     checkPrototypes() { for (const proto of resolverPrototypes) for (const name of Object.getOwnPropertyNames(proto))
       if (/^(resolve|reverse|setServers|cancel)/.test(name)) assert.throws(() => proto[name].call({}), /tripwire/);
     for (const name of ['bind', 'connect', 'send', 'addMembership', 'addSourceSpecificMembership']) assert.throws(() => socketPrototype[name].call({}), /tripwire/); },
-    roots, descriptors, get calls() { return calls; }, get held() { return held.size; },
+    python, roots, descriptors, get calls() { return calls; }, get held() { return held.size; },
     set failure(value) { failure = value; },
     exitOwner(root) {
       assert.ok(realOS);
-      return cp.execFileSync(process.execPath, [...ownerArgs], { env: { HOME: root, TMPDIR: root }, cwd: '/', timeout: 3000, stdio: ['ignore', 'ignore', 'ignore'] });
+      return cp.execFileSync(process.execPath, [...ownerArgs], { env: { HOME: root, TMPDIR: root, PI_TELEGRAM_PYTHON: python }, cwd: '/', timeout: 3000, stdio: ['ignore', 'ignore', 'ignore'] });
     },
-    acquireFd(fd) { return cp.execFileSync('/usr/bin/python3', [...args], { stdio: ['ignore', 'ignore', 'ignore', fd], env: { LANG: 'C', LC_ALL: 'C' }, cwd: '/', timeout: 3000 }); },
+    acquireFd(fd) { return cp.execFileSync(python, [...args], { stdio: ['ignore', 'ignore', 'ignore', fd], env: { LANG: 'C', LC_ALL: 'C' }, cwd: '/', timeout: 3000 }); },
   };
 }

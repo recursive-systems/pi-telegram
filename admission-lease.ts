@@ -2,10 +2,9 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
-// No shell, PATH lookup, input data, credentials, or path arguments. flock is
+// No shell, input data, credentials, or helper path arguments. flock is
 // associated with the inherited open file description, not the helper PID.
 export const ADMISSION_LEASE_HELPER = Object.freeze({
-  executable: '/usr/bin/python3',
   args: Object.freeze(['-I', '-S', '-c',
     'import fcntl,sys\ntry: fcntl.flock(3,fcntl.LOCK_EX|fcntl.LOCK_NB)\nexcept BlockingIOError: sys.exit(3)\n']),
 });
@@ -15,6 +14,30 @@ export class AdmissionLeaseError extends Error {
 }
 function fail(code: string): never { throw new AdmissionLeaseError(code); }
 function check(value: unknown, code: string): asserts value { if (!value) fail(code); }
+// Read-only, bounded and lazy: never execute candidates to discover Python.
+// The operator trusts executable contents/PATH as with the Node/Pi launcher.
+export function resolveAdmissionPython(env: Partial<Pick<NodeJS.ProcessEnv, 'PATH' | 'PI_TELEGRAM_PYTHON'>> = process.env): string {
+  const valid = (value: string) => Buffer.byteLength(value) <= 4096 &&
+    !/[\x00-\x1f\x7f]/.test(value) && path.isAbsolute(value);
+  const executable = (value: string) => {
+    try { return fs.statSync(value).isFile() && (fs.accessSync(value, fs.constants.X_OK), true); }
+    catch { return false; }
+  };
+  if (env.PI_TELEGRAM_PYTHON !== undefined) {
+    check(valid(env.PI_TELEGRAM_PYTHON) && executable(env.PI_TELEGRAM_PYTHON), 'python-override-invalid');
+    return env.PI_TELEGRAM_PYTHON;
+  }
+  const search = env.PATH ?? '';
+  check(Buffer.byteLength(search) <= 32768, 'python-unavailable');
+  const entries = search.split(path.delimiter);
+  check(entries.length <= 128, 'python-unavailable');
+  for (const entry of entries) {
+    if (!valid(entry)) continue; // Never empty/cwd/relative PATH lookup.
+    const candidate = path.join(entry, 'python3');
+    if (valid(candidate) && executable(candidate)) return candidate;
+  }
+  return fail('python-unavailable');
+}
 const owners = new Set<string>();
 function owned(stat: fs.Stats, directory: boolean): void {
   check(directory ? stat.isDirectory() : stat.isFile(), 'unsafe-path');
@@ -69,8 +92,9 @@ export class AdmissionLease {
       const initialFile = fs.fstatSync(fd); owned(initialFile, false);
       const namedFile = fs.lstatSync(file); owned(namedFile, false);
       check(same(initialFile, namedFile) && same(initialRoot, rootStat(root)), 'identity-changed');
+      const executable = resolveAdmissionPython();
       try {
-        execFileSync(ADMISSION_LEASE_HELPER.executable, [...ADMISSION_LEASE_HELPER.args], {
+        execFileSync(executable, [...ADMISSION_LEASE_HELPER.args], {
           stdio: ['ignore', 'ignore', 'ignore', fd],
           env: { LANG: 'C', LC_ALL: 'C' }, cwd: '/', timeout: 3000,
         });

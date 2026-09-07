@@ -241,9 +241,9 @@ unrelated local/jobs prompts never claim Telegram replies. `stop` holds queued
 messages as ordered history for the next Telegram message.
 
 Run deterministic offline regression tests with Node **22.22+** using the
-sanitized, separately grouped procedure under **Offline cross-factory tests**.
+sanitized, separately grouped procedure under **Offline project and cross-factory tests**.
 Do not use an ungrouped `test/*.test.mjs`: boundaries intentionally replace global
-builtins. No dependency installation is required for this reviewed environment.
+builtins. Declared peer dependencies must already be installed; the runner never installs them.
 
 The historical Telegram stall remains **unproven**. Offline tests reproduce a
 specific missed-finalization mechanism, not the original incident. Recovery only
@@ -493,46 +493,64 @@ need manual reconciliation. No durable inbox, parent assessment ledger, crash
 recovery, send fallback repair or exactly-once guarantee is added. Existing send
 fallback ambiguity is unchanged.
 
-#### Offline cross-factory tests
+#### Offline project and cross-factory tests
 
-`test/job-origin.test.mjs` loads **both actual extension factories**, with a shared
-synchronous/caught-error event bus and a fake host/Telegram fetch. It is skipped
-unless `JOBS_SOURCE_ROOT` is explicitly set; production has no repository coupling.
-Use this exact procedure from the reviewed checkout. Each group has a fresh
-mode-0700 HOME/TMPDIR and a separate process. Node and installed read-only peers
-must already exist at the explicit paths; no package download/install is needed.
-The **separate OS suite** requires POSIX directory fsync and `/usr/bin/python3`
-with stdlib `fcntl.flock`. Review the exact helper and private Node-owner fixture
-before running that group. No operational process is signaled or probed.
+Prerequisites: Node **22.22+** with synchronous module hooks/type stripping and
+already-installed declared project peers. From any checkout, select Node through
+your normal PATH **before** the runner sanitizes the child environment:
 
 ```sh
-for GROUP in original integration config store lease lease-os; do
-  SAFE_HOME=$(mktemp -d /tmp/pi-admission-offline.XXXXXX)
-  chmod 700 "$SAFE_HOME"
-  case "$GROUP" in
-    original) set -- test/queue.test.mjs test/reload.test.mjs test/commands.test.mjs test/integration.test.mjs test/job-origin.test.mjs test/markdown.test.mjs ;;
-    *) set -- "test/admission-$GROUP.test.mjs" ;;
-  esac
-  env -i HOME="$SAFE_HOME" TMPDIR="$SAFE_HOME" PATH=/usr/bin:/bin \
-    PI_PACKAGE_DIR=/opt/homebrew/lib/node_modules/@earendil-works/pi-coding-agent \
-    JOBS_SOURCE_ROOT=/Users/bradleygolden/dev/orchestrator \
-    /opt/homebrew/bin/node --experimental-strip-types \
-    --experimental-test-isolation=none --import ./test/offline-bootstrap.mjs \
-    --test --test-concurrency=1 "$@" || exit 1
-  rm -rf "$SAFE_HOME"
-done
+NODE=$(command -v node)
+"$NODE" test/run-offline.mjs # primary checks; no external jobs repository required
+# Equivalent: npm test
+"$NODE" test/run-offline.mjs lease # one fixed group, in its own private environment
 ```
 
-`offline-bootstrap.mjs` resolves the installed Pi public parser and the existing
-read-only legacy TypeBox peer at
-`/Users/bradleygolden/dev/pi-telegram/node_modules/@sinclair/typebox/build/esm/index.mjs`;
-it does not install or load a host runtime. Audit/rebind paths before use elsewhere.
-Factory suites replace the exact lease helper and exact two private job-wrapper
-fixtures; job output/exit files are synthesized, **no scratch scripts or real
-subprocesses execute in factories**. Fake fetch permits only exact fake-bot URLs.
-Socket/HTTP/DNS Resolver/prototype/subprocess tripwires are defense in depth,
-**not an OS sandbox or a ban on every conceivable native networking route**.
-Only the separate OS suite executes the exact reviewed local Python/Node fixtures.
+The runner uses a fresh mode-0700 HOME==TMPDIR for each explicit group, drops the
+inherited environment (including Node options), and installs the existing offline
+boundaries before factories. Primary groups are original, integration, config,
+store, lease, portability. Do not run an ungrouped test glob. In the original
+group, the 42 cross-factory cases are **skipped**, not passed, without jobs opt-in.
+Runner interruption (including SIGINT/SIGTERM) can leave private scratch directories;
+normal `finally` cleanup does not guarantee cleanup on signals.
+
+Ordinary project dependency resolution is the default. For an isolated worktree
+without peers, optionally supply absolute `PI_PACKAGE_DIR` (installed Pi package
+root, resolving its public parser peer) and `TYPEBOX_PACKAGE_DIR` (installed
+legacy `@sinclair/typebox` package root). Package entries are resolved through
+Node's standard package resolver, not private build paths; no host SDK is imported
+for discovery, no other checkouts are scanned, and nothing is downloaded.
+
+Optional producer/consumer compatibility tests load both actual factories only
+when the operator supplies an absolute `JOBS_SOURCE_ROOT` for a compatible jobs
+checkout. These additionally require `PI_PACKAGE_DIR` for the producer's installed
+loader/peers. They are not a prerequisite for the primary project checks:
+
+```sh
+JOBS_SOURCE_ROOT="$JOBS_SOURCE_ROOT" PI_PACKAGE_DIR="$PI_PACKAGE_DIR" \
+  "$NODE" test/run-offline.mjs original
+```
+
+Set those variables to operator-selected directories before that command; empty
+values are invalid. Optional dependency overrides are forwarded only by name.
+
+The **separate OS suite** is never run by default. It requires POSIX directory
+fsync and Python3 with stdlib `fcntl.flock`. Review the helper and private owner
+fixture first, then explicitly run:
+
+```sh
+"$NODE" test/run-offline.mjs lease-os
+# Optional absolute executable override: PI_TELEGRAM_PYTHON=/absolute/python3
+```
+
+Factory suites replace the exact lease helper with an inert file
+fixture and the exact two job-wrapper fixtures; job output/exit files are
+synthesized. **No Python, scratch script, real job or subprocess executes in
+factories.** Fake fetch permits only exact fake-bot URLs. Socket/HTTP/DNS
+Resolver/prototype/subprocess tripwires are defense in depth, **not an OS sandbox
+or a ban on every conceivable native networking route**. Only the opted-in OS
+suite executes one independently pinned Python inode with exact constant argv/fd
+and the exact private Node-owner fixture. No operational PIDs are probed/signaled.
 
 The protocol in `job-origin.ts` mirrors jobs' `origin.ts`; change/version together.
 
@@ -641,12 +659,24 @@ HOME profiles, other bot clients or a headless bridge using the same token;
 existing external one-poller coordination remains necessary.
 
 Runtime prerequisites: POSIX owned private directories, `O_NOFOLLOW`, directory
-fsync, and `/usr/bin/python3` with stdlib `fcntl.flock`. The fixed isolated helper
-runs with `-I -S`, no shell/PATH lookup, minimal environment and a three-second
+fsync, and Python3 with stdlib `fcntl.flock` (not Windows support).
+On acquisition, a read-only lazy resolver selects the first executable `python3`
+in absolute PATH entries. Empty and relative entries (including `.`) are ignored; lookup is bounded
+to 128 entries, 32 KiB total and 4096 bytes per path. Alternatively set
+`PI_TELEGRAM_PYTHON` to one absolute Python3 executable (no arguments). An invalid
+explicit override fails closed, never falls back. The operator must trust that
+executable and PATH directories just as with the Node/Pi launcher; no candidates
+are executed for discovery. Symlinked installed interpreters are supported.
+The fixed isolated helper runs with `-I -S -c` constant code, no shell, no
+configured arguments, only LANG/LC_ALL in its environment, fd3, and a three-second
 timeout. Node retains the exclusive descriptor after helper exit. The mode-0700
 journal root contains one stable empty mode-0600 `<profile-hash>.lock`; it is
 **never deleted**, including after release. Missing support/contention fails
-closed. Do not delete lockfiles or guess stale PIDs to resolve contention.
+closed. Sanitized `python-unavailable` or `python-override-invalid` means install/provide
+Python3 or correct the absolute override/PATH; `helper-unavailable` means verify
+that the selected interpreter supports isolated mode and stdlib fcntl on this
+POSIX filesystem. Diagnostics never expose the selected path or helper stderr.
+Do not delete lockfiles or guess stale PIDs to resolve contention.
 
 Acquisition is lazy, never at factory evaluation. Disconnect releases only after
 all related volatile work is quiescent and the store is closed; otherwise it

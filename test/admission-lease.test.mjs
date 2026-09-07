@@ -34,7 +34,7 @@ function patch(t, key, fn) {
 test('only exact fixed helper contract is permitted, never shells/network', () => {
   assert.throws(() => cp.spawn('anything'), /tripwire/);
   assert.throws(() => fetch('https://invalid.invalid'), /tripwire/);
-  assert.throws(() => cp.execFileSync('/usr/bin/python3', ['-c', 'anything'], {}));
+  assert.throws(() => cp.execFileSync(guard.python, ['-c', 'anything'], {}));
 });
 test('private root-level lease precedes store creation; scope untouched; same-process guard and stable inode', t => {
   const f = fixture(t), lease = f.acquire();

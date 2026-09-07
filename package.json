@@ -33,6 +33,6 @@
     "@earendil-works/pi-tui": "^0.85.0"
   },
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.mjs"
+    "test": "node test/run-offline.mjs"
   }
 }
