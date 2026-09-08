@@ -45,6 +45,43 @@ The extension stores config in:
 ~/.pi/agent/telegram.json
 ```
 
+### Producer-neutral continuation API
+
+Optional completion producers integrate through the versioned process-local event bus
+contract in `continuation-api.ts`; this package has no producer-specific tool, event,
+recipient, payload, or package-version knowledge.
+
+- Emit `pi-telegram:continuation:v1:capture` with `{ version: 1, capture(context) }`
+  during the actual active Telegram-owned turn. The callback is synchronous and returns
+  only an opaque, bounded, serializable context; no chat, nonce, generation or recipient
+  fields are consumer-selectable.
+- Emit `pi-telegram:continuation:v1:offer` with `{ version: 1, producer,
+  completionId, context?, content, semanticFingerprint, mode, reply(response) }`.
+  Emission itself is void and is **not acceptance**. `reply` runs synchronously.
+- `mode: "dispatch"` requires a current captured context. The bridge persists local
+  responsibility before replying `accepted`; an exact retained offer replies
+  `duplicate`. Those are the only dispositions that authorize a producer to transfer
+  its own delivery responsibility.
+- `mode: "existing-only"` may omit context and can only recognize an exact retained
+  dispatch record under current session/configuration/epoch/stop/signature fences. It
+  never creates a record or submits a turn.
+- `mode: "inspection-only"` requires context, persists bounded uncertainty and replies
+  `retained-for-inspection`; it never submits or grants delivery permission. All other
+  outcomes are `declined`.
+
+The producer fingerprint binds producer-specific semantics. Core independently hashes
+actual `content`, so a caller fingerprint cannot hide changed text. Transport callback
+IDs must not be part of stable identity. Accepted busy continuations remain held in the
+ordinary Telegram FIFO. Submission/preflight ambiguity becomes inspection-only
+uncertainty; stop/reload never blindly replays. Cold startup only inspects an existing
+journal and never creates one merely because no optional producer is installed.
+
+The generic journal retains at most 64 records and 4 MiB. Unresolved records are never
+evicted; handled records may be evicted, so exact-retry recognition has a bounded
+horizon. A stale exact retry after stop/session/epoch change declines without poisoning
+unrelated new Telegram input. `accepted` and `duplicate` mean local durable
+responsibility, not model handling or Telegram delivery.
+
 ## Connect a pi session
 
 The Telegram bridge is session-local. Connect it only in the pi session that should own the bot:
@@ -520,6 +557,11 @@ root, resolving its public parser peer) and `TYPEBOX_PACKAGE_DIR` (installed
 legacy `@sinclair/typebox` package root). Package entries are resolved through
 Node's standard package resolver, not private build paths; no host SDK is imported
 for discovery, no other checkouts are scanned, and nothing is downloaded.
+
+The default `continuation` group uses a synthetic producer against the public event-bus
+contract. Core tests and runtime require no optional adapter, upstream producer, YAML,
+or sibling source checkout. Producer-specific contract and watcher fixtures belong to
+the optional adapter's source tree.
 
 Optional producer/consumer compatibility tests load both actual factories only
 when the operator supplies an absolute `JOBS_SOURCE_ROOT` for a compatible jobs

@@ -1,6 +1,7 @@
-import { mkdirSync, realpathSync, readdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, readdirSync } from "node:fs";
 import { AdmissionStore, type AdmissionInput, type AdmissionPhase, type TelegramMediaReference } from "./admission-store.ts";
 import { AdmissionLease } from "./admission-lease.ts";
+import { ContinuationStore, inspectContinuationRecords } from "./continuation-store.ts";
 import { persistTelegramConfig } from "./admission-config.ts";
 import { createHash, createHmac, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
@@ -20,6 +21,9 @@ import { telegramCommands, parseTelegramCommand, telegramHelp } from "./telegram
 import { markdownToTelegramHtml } from "./markdown-to-telegram.ts";
 
 import { ORIGIN_CAPTURE, ORIGIN_CLAIM, ORIGIN_READY, validOrigin, validEpoch, type JobOrigin, type OriginCapture, type OriginClaim } from "./job-origin.ts";
+import { TELEGRAM_CONTINUATION_API_VERSION, TELEGRAM_CONTINUATION_CAPTURE, TELEGRAM_CONTINUATION_OFFER,
+	validContinuationContext, validContinuationId, validContinuationProducer, validSemanticFingerprint,
+	type TelegramContinuationCaptureRequest, type TelegramContinuationOfferRequest, type TelegramContinuationResponse } from "./continuation-api.ts";
 
 interface TelegramConfig {
 	botToken?: string;
@@ -142,6 +146,7 @@ interface DownloadedTelegramFile {
 interface PendingTelegramTurn {
 	incomingIds?: number[];
 	origin?: JobOrigin;
+	continuation?: { producer: string; completionId: string; semanticFingerprint: string };
 	marker: string;
 	chatId: number;
 	replyToMessageId: number;
@@ -361,6 +366,8 @@ export default function (pi: ExtensionAPI) {
 	let bridgeEpoch: string = randomUUID();
 	let originCtx: ExtensionContext | undefined;
 	let originSubscriptions: Array<() => void> = [];
+	const continuationSubmissionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	const continuationTimerKey = (value: { producer: string; completionId: string }) => `${value.producer}\u0000${value.completionId}`;
 	let reloadPending = false;
 	let connectionIntent = 0;
 	let reservation: symbol | undefined;
@@ -412,6 +419,9 @@ export default function (pi: ExtensionAPI) {
 	const mediaGroups = new Map<string, TelegramMediaGroupState>();
 	let profileLease: AdmissionLease | undefined;
 	let inbox: AdmissionStore | undefined;
+	let continuations: ContinuationStore | undefined;
+	let coldContinuations = 0;
+	let continuationColdInspection = false;
 	let inboxRoot: string | undefined;
 	let inboxFault = false;
 	let leaseUncertain = false;
@@ -436,6 +446,25 @@ export default function (pi: ExtensionAPI) {
 	function scopeFor(principal: number): string {
 		return digest(["pi-telegram/admission-records/v1", config.botToken, principal]);
 	}
+	function inspectColdContinuations(): void {
+		if (!config.botToken || config.allowedUserId === undefined) return;
+		try {
+			const intendedRoot = join(realpathSync(PROFILE_HOME), ".pi", "agent", "telegram-inbox");
+			if (!existsSync(intendedRoot)) return;
+			const root = realpathSync(intendedRoot), scope = scopeFor(config.allowedUserId);
+			coldContinuations = inspectContinuationRecords(join(root, scope), scope).filter(record => record.phase !== "handled").length;
+			continuationColdInspection = coldContinuations > 0;
+		} catch { inboxFault = true; continuationColdInspection = true; }
+	}
+	function continuationStore(): ContinuationStore | undefined {
+		if (continuations) return continuations;
+		if (!inbox || !inboxRoot || !profileLease || profileLease.retired || config.allowedUserId === undefined) return undefined;
+		const scope = scopeFor(config.allowedUserId);
+		continuations = ContinuationStore.open(join(inboxRoot, scope), scope);
+		coldContinuations = continuations.inspect().records.filter(record => record.phase !== "handled").length;
+		continuationColdInspection = coldContinuations > 0;
+		return continuations;
+	}
 	function openInbox(principal = config.allowedUserId): void {
 		if (inboxFault) throw new Error("Telegram inbox requires operator repair");
 		ensureLease();
@@ -447,10 +476,15 @@ export default function (pi: ExtensionAPI) {
 			}
 			return;
 		}
-		if (liveIncoming.size || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply)
+		if (liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply)
 			throw new Error("Telegram identity change refused: live ownership");
-		inbox?.close(); inbox = undefined; coldIncoming.clear();
+		inbox?.close(); inbox = undefined; continuations = undefined; coldIncoming.clear();
 		inbox = AdmissionStore.open(inboxRoot!, scope);
+		// The optional producer must not create a journal merely because Telegram connected.
+		try {
+			coldContinuations = inspectContinuationRecords(join(inboxRoot!, scope), scope).filter(record => record.phase !== "handled").length;
+			continuationColdInspection = coldContinuations > 0;
+		} catch (error) { inboxFault = true; throw error; }
 		const snapshot = inbox.inspect();
 		retainedIncoming.clear();
 		for (const record of snapshot.records) retainedIncoming.add(record.updateId);
@@ -464,7 +498,7 @@ export default function (pi: ExtensionAPI) {
 		if (!profileLease || pollingPromise || setupInProgress || apiCalls || preparationCount || finalizingReply) return;
 		if (!closed && (liveIncoming.size || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || uncertainReply || failedIngress.length || failedPreparations.length)) return;
 		if (!closed && !restoredDisconnected) return;
-		inbox?.close(); inbox = undefined;
+		inbox?.close(); inbox = undefined; continuations = undefined;
 		const lease = profileLease; profileLease = undefined;
 		try { lease.release(); } catch { leaseUncertain = true; inboxFault = true; }
 	}
@@ -546,12 +580,12 @@ export default function (pi: ExtensionAPI) {
 		const now = Date.now();
 		const hostIdle = ctx.isIdle(), hostPending = ctx.hasPendingMessages();
 		const state = phases();
-		const blocker = closed ? "closed" : inboxFault ? "admission-repair-required" : coldIncoming.size ? "interrupted-inbox" : recoveryRequired ? "recovery-required" : reloadPending ? "reload-pending" :
+		const blocker = closed ? "closed" : inboxFault ? "admission-repair-required" : coldIncoming.size ? "interrupted-inbox" : continuationColdInspection ? "continuation-inspection" : recoveryRequired ? "recovery-required" : reloadPending ? "reload-pending" :
 			restoredDisconnected ? "restored-disconnected" : failedPreparations.length || failedIngress.length ? "failed-ingress-or-preparation" : state.preflight ? "preflight" : state.held ? "held" :
 			state.submitted ? "submitted" : state.active ? "active-awaiting-settlement" :
 			state.finalizing ? "finalizing" : !hostIdle ? "host-busy" : hostPending ? "host-pending" :
 			queuedTelegramTurns.length ? "awaiting-drain" : state.preparing ? "preparing" : "none";
-		return { admission: { open: !!inbox, fault: inboxFault, live: liveIncoming.size, interrupted: coldIncoming.size, lease: !!profileLease && !profileLease.retired, leaseUncertain }, instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
+		return { admission: { open: !!inbox, fault: inboxFault, live: liveIncoming.size, interrupted: coldIncoming.size, continuationHeld: coldContinuations, lease: !!profileLease && !profileLease.retired, leaseUncertain }, instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
 			queued: queuedTelegramTurns.length, ...state, preparationCount,
 			reloadPending, recoveryRequired, restoredDisconnected, uncertainReply: !!uncertainReply,
 			failedPreparations: failedPreparations.length, failedIngress: failedIngress.length,
@@ -1022,7 +1056,7 @@ export default function (pi: ExtensionAPI) {
 	async function promptForConfig(ctx: ExtensionContext): Promise<void> {
 		if (closed || inboxFault || recoveryRequired || !ctx.hasUI || setupInProgress || reloadPending) return;
 		ensureLease();
-		if (liveIncoming.size || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || failedIngress.length || failedPreparations.length) {
+		if (liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || failedIngress.length || failedPreparations.length) {
 			ctx.ui.notify("Telegram setup refused: live ownership must quiesce first.", "error"); return;
 		}
 		setupInProgress = true;
@@ -1030,7 +1064,7 @@ export default function (pi: ExtensionAPI) {
 			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
 			if (!token || closed) return;
 			await stopPolling();
-			if (closed || liveIncoming.size || preparationCount || queuedTelegramTurns.length) throw new Error("Telegram setup refused: ingress ownership changed");
+			if (closed || liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length) throw new Error("Telegram setup refused: ingress ownership changed");
 
 			const nextConfig: TelegramConfig = { ...config, botToken: token.trim() };
 			const response = await fetch(`https://api.telegram.org/bot${nextConfig.botToken}/getMe`);
@@ -1361,6 +1395,122 @@ export default function (pi: ExtensionAPI) {
 			origin.configDigest, origin.bridgeEpoch, origin.stopGeneration])).digest("hex");
 	}
 
+	function admitOriginContinuation(origin: JobOrigin, text: string): boolean {
+		const ctx = originCtx;
+		if (!ctx || !originReady(ctx) || !currentContinuationOrigin(origin)) return false;
+		const marker = `[turn:${randomUUID()}]`;
+		const continuation = `${TELEGRAM_PREFIX} ${marker} Background completion continuation for original request ${origin.requestMarker}.\n` +
+			"This is a background job result, not a fresh human instruction. Assess the result and continue/report to the original requester as appropriate.\n\n" + text;
+		const turn: PendingTelegramTurn = { marker, origin: { ...origin }, chatId: origin.chatId,
+			replyToMessageId: origin.replyToMessageId, queuedAttachments: [], content: [{ type: "text", text: continuation }], historyText: continuation };
+		queuedTelegramTurns.push(turn);
+		queuedAt.set(turn, Date.now());
+		submitNextTelegramTurn(ctx);
+		if (submittedTelegramTurn === turn || activeTelegramTurn === turn) return true;
+		queuedTelegramTurns = queuedTelegramTurns.filter(candidate => candidate !== turn);
+		return false;
+	}
+
+	function continuationContext(origin: JobOrigin): string {
+		const encoded = [origin.provider, origin.version, origin.sessionId, origin.requestMarker, origin.chatId,
+			origin.replyToMessageId, origin.configDigest, origin.bridgeEpoch, origin.stopGeneration, origin.signature];
+		return Buffer.from(JSON.stringify(encoded)).toString("base64url");
+	}
+	function parseContinuationContext(value: unknown): JobOrigin | undefined {
+		if (!validContinuationContext(value)) return undefined;
+		try {
+			const decoded = Buffer.from(value, "base64url").toString("utf8"), fields: unknown = JSON.parse(decoded);
+			if (!Array.isArray(fields) || fields.length !== 10) return undefined;
+			const parsed: unknown = { provider: fields[0], version: fields[1], sessionId: fields[2], requestMarker: fields[3],
+				chatId: fields[4], replyToMessageId: fields[5], configDigest: fields[6], bridgeEpoch: fields[7],
+				stopGeneration: fields[8], signature: fields[9] };
+			if (!validOrigin(parsed) || continuationContext(parsed) !== value) return undefined;
+			return parsed;
+		} catch { return undefined; }
+	}
+	function currentContinuationOrigin(origin: JobOrigin): boolean {
+		const ctx = originCtx;
+		return !!ctx && validOrigin(origin) && origin.sessionId === ctx.sessionManager.getSessionId() &&
+			origin.configDigest === configDigest(config) && origin.bridgeEpoch === bridgeEpoch &&
+			origin.stopGeneration === stopGeneration && origin.signature === originSignature(origin);
+	}
+	function retainedContinuationStore(): ContinuationStore | undefined {
+		if (continuations) return continuations;
+		if (!inbox || !inboxRoot || !profileLease || profileLease.retired || config.allowedUserId === undefined) return undefined;
+		const scope = scopeFor(config.allowedUserId), file = join(inboxRoot, scope, "continuations.json");
+		if (!existsSync(file)) return undefined;
+		return continuationStore();
+	}
+	function replyContinuation(request: TelegramContinuationOfferRequest, disposition: TelegramContinuationResponse["disposition"]): void {
+		try { request.reply({ version: TELEGRAM_CONTINUATION_API_VERSION, disposition }); } catch { /* Producer callbacks cannot alter ownership. */ }
+	}
+	function acceptContinuationOffer(data: unknown): void {
+		// This handler MUST remain synchronous: event emission is void, not acceptance.
+		const request = data as TelegramContinuationOfferRequest | undefined;
+		if (!request || request.version !== TELEGRAM_CONTINUATION_API_VERSION || typeof request.reply !== "function" ||
+			!validContinuationProducer(request.producer) || !validContinuationId(request.completionId) ||
+			!validSemanticFingerprint(request.semanticFingerprint) || typeof request.content !== "string" ||
+			request.content.length < 1 || request.content.length > 45_000 ||
+			!(request.mode === "dispatch" || request.mode === "existing-only" || request.mode === "inspection-only")) return;
+		if (closed) { replyContinuation(request, "declined"); return; }
+		const suppliedOrigin = request.context === undefined ? undefined : parseContinuationContext(request.context);
+		if (request.context !== undefined && !suppliedOrigin) { replyContinuation(request, "declined"); return; }
+		// A supplied receipt context is an additional authority fence, not permission
+		// to treat revoked authority as a contradiction of a current retained identity.
+		if ((suppliedOrigin && !currentContinuationOrigin(suppliedOrigin)) ||
+			(request.mode !== "existing-only" && !suppliedOrigin)) {
+			replyContinuation(request, "declined"); return;
+		}
+		let store: ContinuationStore | undefined;
+		try { store = request.mode === "existing-only" ? retainedContinuationStore() : continuationStore(); }
+		catch { inboxFault = true; updateStatus(originCtx!, "continuation journal requires operator inspection"); replyContinuation(request, "declined"); return; }
+		if (!store) { replyContinuation(request, "declined"); return; }
+		const retained = store.find(request.producer, request.completionId);
+		if (retained && !currentContinuationOrigin(retained.origin)) { replyContinuation(request, "declined"); return; }
+		if (retained && suppliedOrigin && continuationContext(retained.origin) !== continuationContext(suppliedOrigin)) {
+			inboxFault = true; updateStatus(originCtx!, "continuation identity changed; operator inspection required");
+			replyContinuation(request, "declined"); return;
+		}
+		const contentDigest = createHash("sha256").update(request.content).digest("hex");
+		if (request.mode === "existing-only") {
+			if (retained && retained.intent === "dispatch" && retained.semanticFingerprint === request.semanticFingerprint && retained.contentDigest === contentDigest) replyContinuation(request, "duplicate");
+			else {
+				if (retained?.intent === "dispatch") { inboxFault = true; updateStatus(originCtx!, "continuation identity changed; operator inspection required"); }
+				replyContinuation(request, "declined");
+			}
+			return;
+		}
+		const origin = suppliedOrigin!;
+		const marker = `[turn:${randomUUID()}]`;
+		const inspection = request.mode === "inspection-only";
+		const text = inspection ? `${TELEGRAM_PREFIX} ${marker} Completion retained after delivery ownership was ambiguous.\n\n${request.content}` :
+			`${TELEGRAM_PREFIX} ${marker} Background completion continuation for original request ${origin.requestMarker}.\n` +
+			`This is a ${request.producer} completion result, not a fresh human instruction. Assess the result and continue/report to the original requester as appropriate.\n\n${request.content}`;
+		try {
+			const accepted = store.accept({ producer: request.producer, completionId: request.completionId,
+				semanticFingerprint: request.semanticFingerprint, contentDigest, origin: { ...origin },
+				intent: inspection ? "inspection" : "dispatch", marker, text, phase: inspection ? "uncertain" : "held",
+				updatedAt: Date.now(), ...(inspection ? { note: "producer fallback may own delivery" } : {}) });
+			if (inspection) {
+				if (accepted === "new") coldContinuations++;
+				continuationColdInspection = true; replyContinuation(request, "retained-for-inspection"); return;
+			}
+			if (accepted === "new") {
+				const turn: PendingTelegramTurn = { marker, origin: { ...origin }, continuation: {
+					producer: request.producer, completionId: request.completionId, semanticFingerprint: request.semanticFingerprint },
+					chatId: origin.chatId, replyToMessageId: origin.replyToMessageId, queuedAttachments: [],
+					content: [{ type: "text", text }], historyText: text };
+				queuedTelegramTurns.push(turn); queuedAt.set(turn, Date.now()); coldContinuations++;
+			}
+			// Durable local responsibility exists before this synchronous response.
+			replyContinuation(request, accepted === "new" ? "accepted" : "duplicate");
+			if (accepted === "new") drainTelegramQueue(originCtx!);
+		} catch {
+			inboxFault = true; updateStatus(originCtx!, "continuation handoff uncertain; operator inspection required");
+			replyContinuation(request, "declined");
+		}
+	}
+
 	function subscribeOrigins(ctx: ExtensionContext): void {
 		originCtx = ctx;
 		if (originSubscriptions.length) return;
@@ -1370,28 +1520,18 @@ export default function (pi: ExtensionAPI) {
 			if (!closed && routingTelegram && origin && validOrigin(origin) && request?.sessionId === origin.sessionId &&
 				typeof request.capture === "function") request.capture({ ...origin });
 		}), pi.events.on(ORIGIN_CLAIM, (data: unknown) => {
-			// This handler MUST remain synchronous. emit() is void; async work cannot claim.
 			const request = data as OriginClaim | undefined;
-			const ctx = originCtx;
-			if (!ctx || !request || typeof request.accept !== "function" || !validOrigin(request.origin) ||
+			if (!request || typeof request.accept !== "function" || !validOrigin(request.origin) ||
 				typeof request.text !== "string" || request.text.length > 50_000 || !request.text.startsWith("[jobs] Completed background jobs:")) return;
-			const origin = request.origin;
-			if (!originReady(ctx) || origin.sessionId !== ctx.sessionManager.getSessionId() ||
-				origin.configDigest !== configDigest(config) || origin.bridgeEpoch !== bridgeEpoch || origin.stopGeneration !== stopGeneration || origin.signature !== originSignature(origin)) return;
-			const marker = `[turn:${randomUUID()}]`;
-			const text = `${TELEGRAM_PREFIX} ${marker} Background completion continuation for original request ${origin.requestMarker}.\n` +
-				"This is a background job result, not a fresh human instruction. Assess the result and continue/report to the original requester as appropriate.\n\n" + request.text;
-			const turn: PendingTelegramTurn = { marker, origin: { ...origin }, chatId: origin.chatId,
-				replyToMessageId: origin.replyToMessageId, queuedAttachments: [], content: [{ type: "text", text }], historyText: text };
-			queuedTelegramTurns.push(turn);
-			queuedAt.set(turn, Date.now());
-			submitNextTelegramTurn(ctx);
-			if (submittedTelegramTurn === turn || activeTelegramTurn === turn) request.accept();
-			else {
-				// Synchronous host rejection: producer still owns the pending notification.
-				queuedTelegramTurns = queuedTelegramTurns.filter(t => t !== turn);
+			if (admitOriginContinuation(request.origin, request.text)) request.accept();
+		}), pi.events.on(TELEGRAM_CONTINUATION_CAPTURE, (data: unknown) => {
+			const request = data as TelegramContinuationCaptureRequest | undefined;
+			const origin = activeTelegramTurn?.origin;
+			if (!closed && request?.version === TELEGRAM_CONTINUATION_API_VERSION && typeof request.capture === "function" &&
+				routingTelegram && origin && currentContinuationOrigin(origin)) {
+				try { request.capture(continuationContext(origin)); } catch { /* Capture is best-effort and synchronous. */ }
 			}
-		}));
+		}), pi.events.on(TELEGRAM_CONTINUATION_OFFER, acceptContinuationOffer));
 	}
 
 	function submitNextTelegramTurn(ctx: ExtensionContext): void {
@@ -1401,14 +1541,33 @@ export default function (pi: ExtensionAPI) {
 			if (originReady(ctx)) pi.events.emit(ORIGIN_READY, { provider: "telegram", version: 1 });
 			return;
 		}
-		try { journalTurn(turn, "dispatching"); }
-		catch { updateStatus(ctx, "admission dispatch blocked; operator repair required"); return; }
+		try {
+			journalTurn(turn, "dispatching");
+			if (turn.continuation) { if (!continuations) throw new Error("continuation store unavailable"); continuations.transition(turn.continuation.producer, turn.continuation.completionId, turn.continuation.semanticFingerprint, "dispatching", Date.now()); }
+		}
+		catch { inboxFault = true; updateStatus(ctx, "admission dispatch blocked; operator repair required"); return; }
 		submittedTelegramTurn = turn;
 		transition("submitted");
 		updateStatus(ctx);
 		try {
 			pi.sendUserMessage(turn.content);
+			if (turn.continuation && submittedTelegramTurn === turn) {
+				const continuation = turn.continuation, key = continuationTimerKey(continuation);
+				const timer = setTimeout(() => {
+					continuationSubmissionTimers.delete(key);
+					if (submittedTelegramTurn !== turn) return;
+					try { if (!continuations) throw new Error("continuation store unavailable"); continuations.transition(continuation.producer, continuation.completionId, continuation.semanticFingerprint, "uncertain", Date.now(), "host admission not observed"); }
+					catch { inboxFault = true; }
+					updateStatus(ctx, "continuation admission uncertain; operator inspection required");
+				}, 5000);
+				timer.unref(); continuationSubmissionTimers.set(key, timer);
+			}
 		} catch (error) {
+			if (turn.continuation) {
+				try { if (!continuations) throw new Error("continuation store unavailable"); continuations.transition(turn.continuation.producer, turn.continuation.completionId, turn.continuation.semanticFingerprint, "uncertain", Date.now(), "synchronous submission rejection"); }
+				catch { inboxFault = true; }
+				queuedTelegramTurns = queuedTelegramTurns.filter(candidate => candidate !== turn);
+			}
 			// A synchronous rejection did not accept the turn. Keep it in FIFO order.
 			if (turn.incomingIds?.length) {
 				uncertainReply = turn;
@@ -1445,6 +1604,15 @@ export default function (pi: ExtensionAPI) {
 
 	function localSafetyStop(ctx: ExtensionContext): void {
 		preserveQueuedTurnsAsHistory = true;
+		for (const turn of queuedTelegramTurns.filter(candidate => candidate.continuation && candidate !== submittedTelegramTurn)) {
+			try { continuations?.transition(turn.continuation!.producer, turn.continuation!.completionId, turn.continuation!.semanticFingerprint, "uncertain", Date.now(), "stopped before dispatch"); }
+			catch { inboxFault = true; }
+		}
+		queuedTelegramTurns = queuedTelegramTurns.filter(turn => !turn.continuation || turn === submittedTelegramTurn);
+		if (submittedTelegramTurn?.continuation) {
+			try { continuations?.transition(submittedTelegramTurn.continuation.producer, submittedTelegramTurn.continuation.completionId, submittedTelegramTurn.continuation.semanticFingerprint, "uncertain", Date.now(), "stopped during host admission"); }
+			catch { inboxFault = true; }
+		}
 		stopGeneration++;
 		transition("stop-held");
 		currentAbort?.();
@@ -1614,7 +1782,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function refuseReload(ctx: ExtensionContext): boolean {
-		if (inboxFault || coldIncoming.size || uncertainReply || submittedTelegramTurn || preflightPending || failedPreparations.length || failedIngress.length || setupInProgress) {
+		if (inboxFault || coldIncoming.size || uncertainReply || submittedTelegramTurn || queuedTelegramTurns.some(turn => !!turn.continuation) || preflightPending || failedPreparations.length || failedIngress.length || setupInProgress) {
 			ctx.ui.notify("Telegram reload refused: unacknowledged/preflight, uncertain reply, or failed preparation work. Preserve affected messages before ordinary teardown; no automatic replay.", "error");
 			return true;
 		}
@@ -1904,7 +2072,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			ensureLease();
 			const next = await loadConfig();
-			if ((configDigest(next) !== configDigest(config) || next.lastUpdateId !== config.lastUpdateId) && (liveIncoming.size || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || pollingPromise)) {
+			if ((configDigest(next) !== configDigest(config) || next.lastUpdateId !== config.lastUpdateId) && (liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || pollingPromise)) {
 				ctx.ui.notify("Telegram identity change refused: live ownership.", "error"); return;
 			}
 			config = next;
@@ -1939,7 +2107,7 @@ export default function (pi: ExtensionAPI) {
 		if (event.reason !== "reload") {
 			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
-			updateStatus(ctx);
+			inspectColdContinuations(); updateStatus(ctx);
 			return;
 		}
 		const entries = ctx.sessionManager.getEntries();
@@ -1947,7 +2115,7 @@ export default function (pi: ExtensionAPI) {
 		if (!entry || entry.type !== "custom") {
 			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
-			updateStatus(ctx);
+			inspectColdContinuations(); updateStatus(ctx);
 			return;
 		}
 		const saved = entry.data as ReloadCheckpoint;
@@ -1961,7 +2129,7 @@ export default function (pi: ExtensionAPI) {
 			entries.some(e => e.type === "custom" && e.customType === CLAIM_TYPE && (e.data as { nonce?: string })?.nonce === saved.nonce)) {
 			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
-			updateStatus(ctx);
+			inspectColdContinuations(); updateStatus(ctx);
 			ctx.ui.notify("No valid live Telegram reload handoff; disconnected. Any archived checkpoint remains private session data, not permission to replay it.", "info");
 			return;
 		}
@@ -2028,6 +2196,8 @@ export default function (pi: ExtensionAPI) {
 		}
 		closed = true;
 		for (const unsubscribe of originSubscriptions.splice(0)) unsubscribe();
+		for (const timer of continuationSubmissionTimers.values()) clearTimeout(timer);
+		continuationSubmissionTimers.clear();
 		originCtx = undefined;
 		menuController?.abort();
 		menuController = undefined;
@@ -2056,13 +2226,29 @@ export default function (pi: ExtensionAPI) {
 		maybeReleaseLease();
 	});
 
+
 	pi.on("before_agent_start", async (event, ctx) => {
 		if (closed) return;
 		preflightPending = true;
 		const turn = submittedTelegramTurn;
-		routingTelegram = !!turn && event.prompt.includes(turn.marker);
+		const continuationOriginCurrent = !turn?.continuation || !!turn.origin && currentContinuationOrigin(turn.origin);
+		routingTelegram = !!turn && continuationOriginCurrent && event.prompt.includes(turn.marker);
+		if (turn?.continuation && !continuationOriginCurrent) {
+			const key = continuationTimerKey(turn.continuation), timer = continuationSubmissionTimers.get(key); if (timer) clearTimeout(timer);
+			continuationSubmissionTimers.delete(key);
+			try { continuations?.transition(turn.continuation.producer, turn.continuation.completionId, turn.continuation.semanticFingerprint, "uncertain", Date.now(), "origin boundary changed before host start"); }
+			catch { inboxFault = true; }
+			submittedTelegramTurn = undefined; queuedTelegramTurns = queuedTelegramTurns.filter(candidate => candidate !== turn);
+		}
 		if (routingTelegram && turn) {
-			try { journalTurn(turn, "active"); }
+			if (turn.continuation) {
+				const key = continuationTimerKey(turn.continuation), timer = continuationSubmissionTimers.get(key); if (timer) clearTimeout(timer);
+				continuationSubmissionTimers.delete(key);
+			}
+			try {
+				journalTurn(turn, "active");
+				if (turn.continuation) { if (!continuations) throw new Error("continuation store unavailable"); continuations.transition(turn.continuation.producer, turn.continuation.completionId, turn.continuation.semanticFingerprint, "active", Date.now()); }
+			}
 			catch {
 				// Host proceeds after this hook, even on error. Retain volatile routing.
 				uncertainReply = turn;
@@ -2214,6 +2400,12 @@ export default function (pi: ExtensionAPI) {
 			try {
 				await clearPreview(turn.chatId);
 				if (!closed) journalTurn(turn, localSuccess ? "handled" : "uncertain");
+				if (!closed && turn.continuation) {
+					const handled = localSuccess && lastTelegramAssistant.stopReason !== "aborted";
+					if (!continuations) throw new Error("continuation store unavailable");
+					continuations.transition(turn.continuation.producer, turn.continuation.completionId, turn.continuation.semanticFingerprint, handled ? "handled" : "uncertain", Date.now(), handled ? undefined : "Telegram finalization not confirmed");
+					if (handled) coldContinuations = Math.max(0, coldContinuations - 1);
+				}
 				if (!localSuccess && turn.incomingIds?.length) uncertainReply = turn;
 				else if (localSuccess && uncertainReply === turn) uncertainReply = undefined;
 			} catch { uncertainReply = turn; inboxFault = true; }
