@@ -20,6 +20,8 @@ export const assistant = (text = 'answer', stopReason = 'stop') => ({ role: 'ass
 export async function harness(t, options = {}) {
   t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
   const home = await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
+  const initialTools = options.toolCatalogFactory?.(home) ?? options.toolCatalog ?? [];
+  let allTools = initialTools;
   leaseBoundary.roots.add(join(home, '.pi/agent/telegram-inbox'));
   const oldHome = process.env.HOME, oldTmp = process.env.TMPDIR;
   process.env.HOME = home; process.env.TMPDIR = home;
@@ -44,10 +46,10 @@ export async function harness(t, options = {}) {
   const bus = new EventEmitter();
   const compactions = [];
   const identityUsername = options.identity ?? options.config?.botUsername;
-  let discovered = options.discovered ?? [], commandSubmission = options.commandSubmission;
+  let discovered = options.discovered ?? [], commandSubmission = options.commandSubmission, userSubmission = options.userSubmission;
   const sent = [], network = [], statuses = [], errors = [], notices = [], entries = [], submissions = [], lifecycle = [], serverUpdates = [];
   let generation = 0, activePolls = 0, maxPolls = 0, idleWaiter = deferred(), reloadHook = async () => {}, appendHook = () => {};
-  let sessionId = 'fake-session', sessionFile = join(home, 'session.jsonl');
+  let sessionId = 'fake-session', sessionName = options.sessionName ?? 'Offline', sessionFile = join(home, 'session.jsonl');
   // Real Pi may name a fresh session before it has ever flushed a JSONL file.
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
   let reloadMode = 'normal', sessionFileRead = () => {};
@@ -90,7 +92,7 @@ export async function harness(t, options = {}) {
       },
     };
     generation++;
-    if (omitExtension && !options.jobsFactory) {
+    if (omitExtension && !options.jobsFactory && !options.companionFactory) {
       // _buildRuntime restores runtime flags even if imports omitted this extension.
       for (const [name, value] of restoredFlags ?? []) flagValues.set(name, value);
       return;
@@ -110,12 +112,13 @@ export async function harness(t, options = {}) {
         const safe = async data => { try { await handler(data); } catch (error) { errors.push(error); } };
         bus.on(name, safe); return () => bus.off(name, safe);
       },
-    }, registerEntryRenderer() {}, getSessionName: () => 'Offline',
+    }, registerEntryRenderer() {}, getSessionName: () => sessionName,
     on: (name, fn) => {
       const prior = handlers.get(name);
       handlers.set(name, prior ? async (...args) => { await prior(...args); return fn(...args); } : fn);
     }, registerCommand: (name, command) => commands.set(name, command),
       registerFlag: (name, options) => { if (!flagValues.has(name)) flagValues.set(name, options.default); },
+      getAllTools: () => { check(); if (options.toolCatalogThrows) throw new Error('fixture catalog unavailable'); return allTools; },
       getCommands: () => { check(); if (options.catalogThrows) throw new Error('SECRET'); return [...(options.reloadCatalog ?? [{ name: 'telegram-reload', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } }]), ...discovered]; },
       getFlag: name => { check(); return flagValues.get(name); },
       registerTool: tool => { check(); registrations.push(tool.name); tools.set(tool.name, tool); },
@@ -127,6 +130,7 @@ export async function harness(t, options = {}) {
       },
       sendUserMessage: (content, opts) => {
         check(); submissions.push({ content, opts });
+        if (!opts?.expandPromptTemplates && userSubmission === 'throw') throw new Error('fake synchronous user submission failure');
         // Faithful Pi: command dispatch is BEFORE streaming checks, and the API
         // catches async errors and returns void, never command completion.
         if (opts?.expandPromptTemplates && typeof content === 'string' && content.startsWith('/')) {
@@ -138,9 +142,12 @@ export async function harness(t, options = {}) {
         sent.push(content); onSend(content);
       },
     };
+    if (options.omitGetAllTools) delete api.getAllTools;
+    if (options.companionFirst) options.companionFactory?.(api);
     if (options.jobsFirst) options.jobsFactory?.(api);
     extension?.(api);
     if (!options.jobsFirst) options.jobsFactory?.(api);
+    if (!options.companionFirst) options.companionFactory?.(api);
     factoryTools.push(...tools.keys());
     factoryFlag = flagValues.get('telegram-diagnostics');
     // Host factories see defaults; CLI overrides/restored flags precede startup.
@@ -179,6 +186,8 @@ export async function harness(t, options = {}) {
     bus, home, sent, network, compactions, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
     set configWrite(value) { configWrite = value; },
     set discovered(value) { discovered = value; }, set commandSubmission(value) { commandSubmission = value; },
+    set allTools(value) { allTools = value; }, get allTools() { return allTools; },
+    set userSubmission(value) { userSubmission = value; },
     get handlers() { return handlers; },
     get factoryFlag() { return factoryFlag; }, get factoryTools() { return factoryTools; },
     get registrations() { return registrations; }, get tools() { return tools; }, get ctx() { return ctx; },
@@ -195,7 +204,7 @@ export async function harness(t, options = {}) {
     set reloadHook(value) { reloadHook = value; }, set appendHook(value) { appendHook = value; },
     set reloadMode(value) { reloadMode = value; },
     set sessionFileRead(value) { sessionFileRead = value; },
-    set sessionId(value) { sessionId = value; }, set sessionFile(value) { sessionFile = value; },
+    set sessionId(value) { sessionId = value; }, set sessionName(value) { sessionName = value; }, set sessionFile(value) { sessionFile = value; },
     command: (name, args = '') => commands.get(name).handler(args, ctx),
     reloadTool: () => tools.get('telegram_reload').execute('call', {}, undefined, undefined, ctx),
     async replace(reason, omitExtension = false) {
@@ -265,7 +274,7 @@ export async function harness(t, options = {}) {
     async shutdown() { await emit('session_shutdown'); },
   };
   t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; process.env.TMPDIR = oldTmp; leaseBoundary.roots.delete(join(home, '.pi/agent/telegram-inbox')); await rm(home, { recursive: true, force: true }); });
-  await instantiate();
+  await instantiate(options.omitCore === true);
   await emit('session_start', { reason: options.sessionReason ?? 'startup' });
   if (options.connected !== false) {
     await commands.get('telegram-connect').handler('', ctx);

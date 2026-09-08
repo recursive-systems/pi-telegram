@@ -12,6 +12,7 @@ const groups = {
   store: ['test/admission-store.test.mjs'],
   lease: ['test/admission-lease.test.mjs'],
   portability: ['test/portability.test.mjs'],
+  continuation: ['test/continuation-store.test.mjs', 'test/continuation-api.test.mjs'],
   'lease-os': ['test/admission-lease-os.test.mjs'],
 };
 const requested = process.argv.slice(2);

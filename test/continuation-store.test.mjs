@@ -1,0 +1,17 @@
+import './admission-harness-boundary.mjs';
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { createHmac, randomUUID } from 'node:crypto';
+import { syncBuiltinESMExports } from 'node:module';
+import { ContinuationStore, inspectContinuationRecords } from '../continuation-store.ts';
+const scope = 'a'.repeat(64);
+function fixture(t) { const root = fs.mkdtempSync(path.join(os.tmpdir(), 'continuation-store-')); fs.chmodSync(root, 0o700); const dir = path.join(root, scope); fs.mkdirSync(dir, { mode: 0o700 }); t.after(() => fs.rmSync(root, { recursive: true })); return dir; }
+function record(completionId = randomUUID(), semanticFingerprint = 'b'.repeat(64)) { const unsigned = { provider: 'telegram', version: 1, sessionId: 's', requestMarker: `[turn:${randomUUID()}]`, chatId: 1, replyToMessageId: 1, configDigest: 'c'.repeat(64), bridgeEpoch: randomUUID(), stopGeneration: 0 }; return { producer: 'fixture.producer', completionId, semanticFingerprint, contentDigest: 'd'.repeat(64), origin: { ...unsigned, signature: createHmac('sha256', 'fixture').update('x').digest('hex') }, intent: 'dispatch', marker: `[turn:${randomUUID()}]`, text: 'bounded result', phase: 'held', updatedAt: 1 }; }
+test('durable generic accept, exact retry and changed identity refusal survive reopen', t => { const dir = fixture(t), r = record(); let store = ContinuationStore.open(dir, scope); assert.equal(store.accept(r), 'new'); assert.equal(store.accept({ ...r }), 'same'); assert.throws(() => store.accept({ ...r, semanticFingerprint: 'e'.repeat(64) }), /changed-completion/); assert.throws(() => store.accept({ ...r, contentDigest: 'f'.repeat(64) }), /changed-completion/); store = ContinuationStore.open(dir, scope); assert.equal(store.inspect().records[0].text, r.text); });
+test('read-only cold inspection exposes unresolved records without creating state', t => { const dir = fixture(t); assert.deepEqual(inspectContinuationRecords(dir, scope), []); assert.equal(fs.existsSync(path.join(dir, 'continuations.json')), false); const r = record(), store = ContinuationStore.open(dir, scope); store.accept(r); assert.deepEqual(inspectContinuationRecords(dir, scope), [r]); });
+test('inspection intent is uncertain at first durable publication', t => { const dir = fixture(t), store = ContinuationStore.open(dir, scope), r = { ...record(), intent: 'inspection', phase: 'uncertain', note: 'fallback may own delivery' }; assert.equal(store.accept(r), 'new'); assert.equal(store.inspect().records[0].phase, 'uncertain'); });
+test('rename failure never accepts and poisons retry', t => { const dir = fixture(t), store = ContinuationStore.open(dir, scope), original = fs.renameSync; fs.renameSync = () => { throw new Error('fixture rename failure'); }; syncBuiltinESMExports(); try { assert.throws(() => store.accept(record())); assert.equal(store.inspect().records.length, 0); assert.throws(() => store.accept(record()), /reopen-required/); } finally { fs.renameSync = original; syncBuiltinESMExports(); } });
+test('corrupt and permissive journals fail closed', t => { const dir = fixture(t); ContinuationStore.open(dir, scope); const file = path.join(dir, 'continuations.json'); fs.writeFileSync(file, '{}'); assert.throws(() => ContinuationStore.open(dir, scope), /invalid-schema/); fs.chmodSync(file, 0o644); assert.throws(() => ContinuationStore.open(dir, scope), /unsafe-path/); });
