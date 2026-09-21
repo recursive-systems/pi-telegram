@@ -8,6 +8,7 @@ export const telegramCommands = [
 	{ command: "bridge_status", description: "Show content-free bridge state", args: "[detail]" },
 	{ command: "version", description: "Show cached checkout version (not loaded-code proof)", args: "" },
 	{ command: "compact", description: "Compact idle Pi context with optional instructions", args: "[instructions]" },
+	{ command: "new", description: "Start a fresh Pi session and keep Telegram connected (idle only)", args: "" },
 	{ command: "stop", description: "Abort the run and hold queued history", args: "" },
 	{ command: "telegram_reload", description: "Request safe runtime reload (not an upgrade)", args: "" },
 ] as const;
@@ -26,6 +27,7 @@ export function parseTelegramCommand(text: string, ownUsername?: string) {
 export function telegramHelp(discovered: unknown): string {
 	const lines = ["Telegram commands (implemented remotely):", ...telegramCommands.map(c => `/${c.command}${c.args ? ` ${c.args}` : ""} — ${c.description}`),
 		"Bare stop also works. Commands require standalone text; captions remain normal input.",
+		"/new discards this session's context: queued or held Telegram turns are never replayed and refuse the handoff.",
 		"Other slash commands are not executed or forwarded. /reload: use /telegram_reload.",
 		"/telegram-inbox is LOCAL ONLY: inspect/reconcile retained input; no remote acknowledge or replay.",
 		"Pi catalog — LOCAL ONLY, not supported remotely (no automatic aliases):"];
