@@ -162,12 +162,28 @@ Send `/commands`, `/help`, or `/start` for help. Implemented remote routes:
 | Command | Response/action |
 | --- | --- |
 | `/status` | Model and token usage |
+| `/model [provider/model [thinking]]` | Show the active model and the session's selectable models, or switch (idle only) **without a model turn** |
 | `/bridge_status [detail]` | Content-free bridge diagnostics sampled directly, **without a model turn** |
 | `/version` | Lazy cached checkout version, not loaded-code attestation |
 | `/compact [instructions]` | Compact only while Pi is idle; optional instruction text preserves case |
 | `/stop` or bare `stop` | Abort and hold queued history |
 | `/telegram_reload` | Request the existing safe runtime handoff, not install/upgrade source |
 | `/commands`, `/help`, `/start` | Help and a bounded local-only Pi catalog |
+
+`/model` exists so the session can be moved off an unavailable provider from the
+phone: it calls the host's model registry directly and never needs the current
+model to answer. Targets are limited to the session's scoped models
+(`--models` / `enabledModels`), or the registry's available models when no scope
+is configured; exact ids only, with a bare id accepted when unique. Switching
+requires an idle Pi (`stop` first), applies the optional thinking level only
+after a successful switch, and reports the result. Thinking levels are Pi's
+provider-neutral vocabulary (`off` … `max`); Pi clamps to what the chosen model
+supports and the reply states the effective level, naming the request when it
+was clamped. A refused switch (no
+credentials, out of scope, ambiguous, busy) changes nothing; a host failure is
+reported without provider detail. The change is Pi's ordinary session model
+change: recorded in the session, not written to settings, and independent of
+any fallback extension.
 
 Only standalone text is interpreted as a command. Captions, albums and messages
 with attachments stay normal model input and preserve files/FIFO. Command names

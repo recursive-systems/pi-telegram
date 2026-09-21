@@ -37,7 +37,7 @@ for (const extra of [{ from: { id: 8 } }, { chat: { id: 80, type: 'group' } }, {
 
 test('suffixes preserve target checks; unknown commands are honest and never model prompts', async t => {
   const h = await harness(t, { config: { botUsername: 'Own_Bot' } });
-  for (const cmd of ['/stop@other_bot', '/made_up', '/model', '/login', '/skill:foo', '/reload', '/telegram-reload']) await h.receive(cmd);
+  for (const cmd of ['/stop@other_bot', '/made_up', '/login', '/skill:foo', '/reload', '/telegram-reload']) await h.receive(cmd);
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).held, false);
   assert.match(replies(h), /not executed/); assert.match(replies(h), /safe handoff/);
   await h.receive('/STOP@oWn_bOt'); assert.equal((await h.diagnostic()).held, true);
@@ -50,9 +50,10 @@ test('unknown own username refuses addressed commands', async t => {
 
 test('argument validation, compact custom instructions and busy guard', async t => {
   const h = await harness(t);
-  for (const c of telegramCommands.filter(c => c.command !== 'compact')) await h.receive('/' + c.command + ' nope');
+  for (const c of telegramCommands.filter(c => c.command !== 'compact' && c.command !== 'model')) await h.receive('/' + c.command + ' nope');
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).held, false);
   assert.match(replies(h), /Usage:/);
+  await h.receive('/model nope nope nope'); assert.match(replies(h), /Usage: \/model/);
   await h.receive('/compact Keep CASE\nAnd Text');
   assert.equal(h.compactions[0].customInstructions, 'Keep CASE\nAnd Text');
   await h.start('local'); await h.receive('/compact Other'); assert.equal(h.compactions.length, 1);

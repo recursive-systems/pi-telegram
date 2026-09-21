@@ -4,6 +4,7 @@ export const telegramCommands = [
 	{ command: "help", description: "Show Telegram help", args: "" },
 	{ command: "start", description: "Show Telegram help", args: "" },
 	{ command: "status", description: "Show model and token usage", args: "" },
+	{ command: "model", description: "Show or switch the session model while idle", args: "[provider/model [thinking]]" },
 	{ command: "bridge_status", description: "Show content-free bridge state", args: "[detail]" },
 	{ command: "version", description: "Show cached checkout version (not loaded-code proof)", args: "" },
 	{ command: "compact", description: "Compact idle Pi context with optional instructions", args: "[instructions]" },

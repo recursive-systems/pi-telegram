@@ -32,5 +32,7 @@ see its AGENTS.md for the one-poller-per-token handoff protocol (`/stop`).
 - ~~`markdown-to-telegram.ts` — markdown → Telegram-safe HTML replies~~
   (ported 2026-09-02; wired into previews, final messages, and
   `sendTextReply` with plain-text fallback on API rejection)
-- `/model` command — `ctx.model` is exposed by the ExtensionAPI
+- ~~`/model` command — `ctx.model` is exposed by the ExtensionAPI~~ (added
+  2026-09-21 as a direct remote route in `model-command.ts` + `index.ts`;
+  scoped-model targets, idle-only switch, no model turn)
 - Multi-ID allowlist instead of single paired user
