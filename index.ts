@@ -17,6 +17,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Type } from "@sinclair/typebox";
 
 import { telegramCommands, parseTelegramCommand, telegramHelp } from "./telegram-commands.ts";
+import { describeModels, modelLabel, parseModelSelection, resolveModelSelection, thinkingLevels } from "./model-command.ts";
 
 import { markdownToTelegramHtml } from "./markdown-to-telegram.ts";
 
@@ -1253,6 +1254,39 @@ export default function (pi: ExtensionAPI) {
 				},
 			});
 			await sendTextReply(firstMessage.chat.id, firstMessage.message_id, "Compaction started.");
+			return;
+		}
+
+		if (lower === "/model") {
+			// Direct host calls, never a model turn: this must work when the active provider is down.
+			const selection = parseModelSelection(command?.args ?? "");
+			if (selection === "invalid") {
+				await reply(`Usage: /model ${route!.args}\nThinking levels: ${thinkingLevels.join(", ")}`);
+				return;
+			}
+			// Only the session's scoped list (or the registry's available models when
+			// unscoped) is selectable. Mirrors Pi's own picker; no arbitrary catalogue.
+			const scoped = ctx.scopedModels ?? [];
+			const models = scoped.length ? scoped.map(entry => entry.model) : ctx.modelRegistry.getAvailable();
+			const candidates = models.map(model => ({ provider: model.provider, id: model.id, auth: ctx.modelRegistry.hasConfiguredAuth(model), model }));
+			if (!selection) {
+				await reply(describeModels(ctx.model, pi.getThinkingLevel(), candidates, scoped.length > 0));
+				return;
+			}
+			if (!ctx.isIdle()) {
+				await reply("Cannot switch models while pi is busy. Send \"stop\" first.");
+				return;
+			}
+			const resolved = resolveModelSelection(selection, candidates);
+			if ("error" in resolved) { await reply(resolved.error); return; }
+			const label = modelLabel(resolved.model);
+			let switched: boolean | undefined;
+			try { switched = await pi.setModel(resolved.model.model); } catch { switched = undefined; }
+			if (closed || intent !== connectionIntent) return;
+			if (switched === undefined) { await reply(`Switching to ${label} failed; inspect Pi locally.`); return; }
+			if (!switched) { await reply(`Could not switch to ${label}: no credentials configured. Model unchanged.`); return; }
+			if (selection.thinking) pi.setThinkingLevel(selection.thinking);
+			await reply(`Model: ${label} (thinking: ${pi.getThinkingLevel()})`);
 			return;
 		}
 

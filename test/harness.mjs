@@ -54,6 +54,11 @@ export async function harness(t, options = {}) {
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
   let reloadMode = 'normal', sessionFileRead = () => {};
   let idle = true, compacting = false, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
+  // Model registry fixture: session-level state survives host reinstantiation like real Pi.
+  const models = (options.models ?? []).map(m => ({ provider: m.provider, id: m.id, name: m.id, auth: m.auth !== false }));
+  const modelRef = ref => models.find(m => `${m.provider}/${m.id}` === ref);
+  let currentModel = options.currentModel ? modelRef(options.currentModel) : undefined, thinking = options.thinking ?? 'medium';
+  const modelChanges = [], thinkingChanges = [];
   const emit = async (name, event = {}) => {
     try { return await handlers.get(name)?.({ type: name, ...event }, ctx); }
     catch (error) { if (!options.faithfulHost) throw error; errors.push(error); }
@@ -69,6 +74,10 @@ export async function harness(t, options = {}) {
       getContextUsage: () => { check(); return undefined; },
       compact: opts => { check(); compactions.push(opts); },
       isIdle: () => { check(); return idle && !compacting; }, hasPendingMessages: () => { check(); return pending; },
+      get model() { check(); return currentModel; },
+      get scopedModels() { check(); return (options.scoped ?? []).map(ref => ({ model: modelRef(ref) })); },
+      modelRegistry: { find: (provider, id) => { check(); return models.find(m => m.provider === provider && m.id === id); },
+        getAvailable: () => { check(); return models.filter(m => m.auth); }, hasConfiguredAuth: m => { check(); return m.auth; } },
       abort: () => { check(); h.aborts++; },
       waitForIdle: async () => { check(); if (!idle || compacting) await idleWaiter.promise; },
       sessionManager: { getEntries: () => { check(); return entries; }, getSessionId: () => { check(); return sessionId; },
@@ -121,6 +130,14 @@ export async function harness(t, options = {}) {
       getAllTools: () => { check(); if (options.toolCatalogThrows) throw new Error('fixture catalog unavailable'); return allTools; },
       getCommands: () => { check(); if (options.catalogThrows) throw new Error('SECRET'); return [...(options.reloadCatalog ?? [{ name: 'telegram-reload', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } }]), ...discovered]; },
       getFlag: name => { check(); return flagValues.get(name); },
+      setModel: async model => {
+        check(); modelChanges.push(`${model.provider}/${model.id}`);
+        if (options.setModel === 'throw') throw new Error('SECRET provider detail');
+        if (!model.auth) return false;
+        currentModel = model; return true;
+      },
+      getThinkingLevel: () => { check(); return thinking; },
+      setThinkingLevel: level => { check(); thinking = level; thinkingChanges.push(level); },
       registerTool: tool => { check(); registrations.push(tool.name); tools.set(tool.name, tool); },
       appendEntry: (customType, data) => {
         check(); appendHook(customType);
@@ -184,6 +201,7 @@ export async function harness(t, options = {}) {
   });
   const h = {
     bus, home, sent, network, compactions, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    modelChanges, thinkingChanges, get currentModel() { return currentModel; }, get thinking() { return thinking; },
     set configWrite(value) { configWrite = value; },
     set discovered(value) { discovered = value; }, set commandSubmission(value) { commandSubmission = value; },
     set allTools(value) { allTools = value; }, get allTools() { return allTools; },
