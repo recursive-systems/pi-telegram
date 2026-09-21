@@ -26,10 +26,10 @@
     ]
   },
   "peerDependencies": {
-    "@mariozechner/pi-agent-core": "*",
-    "@mariozechner/pi-ai": "*",
-    "@mariozechner/pi-coding-agent": "*",
-    "@sinclair/typebox": "*",
+    "@earendil-works/pi-agent-core": "^0.85.0",
+    "@earendil-works/pi-ai": "^0.85.0",
+    "@earendil-works/pi-coding-agent": "^0.85.0",
+    "typebox": "*",
     "@earendil-works/pi-tui": "^0.85.0"
   },
   "scripts": {

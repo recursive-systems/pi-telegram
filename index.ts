@@ -12,10 +12,10 @@ import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 import { telegramCommands, parseTelegramCommand, telegramHelp } from "./telegram-commands.ts";
 import { describeModels, modelLabel, parseModelSelection, resolveModelSelection, thinkingLevels } from "./model-command.ts";
