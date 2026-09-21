@@ -378,7 +378,7 @@ test('a never-persisted session refuses /new and reports it remotely', async t =
 test('/new coalesces with a pending reload request without claiming a new session', async t => {
   const h = await harness(t);
   await h.start('local');
-  await h.receive('/telegram_reload');
+  await h.receive('/reload');
   await h.receive('/new');
   assert.match(replies(h), /A Telegram handoff is already pending; \/new was not submitted/);
   assert.equal(h.submissions.filter(s => s.content === '/telegram-new').length, 0);

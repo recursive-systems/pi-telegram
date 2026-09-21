@@ -1236,7 +1236,7 @@ export default function (pi: ExtensionAPI) {
 		if (command?.foreign) { await reply("Command addressed to another or unknown bot; not executed."); return; }
 		const route = command && telegramCommands.find(c => c.command === command.name);
 		if (command && !route) {
-			await reply(command.name === "reload" ? "Ordinary /reload is not supported remotely. Use /telegram_reload for a safe handoff."
+			await reply(command.name === "telegram_reload" ? "/telegram_reload was renamed. Use /reload for a safe handoff."
 				: "Unknown or unavailable Telegram command; not executed or sent to pi. Use /commands.");
 			return;
 		}
@@ -1251,7 +1251,7 @@ export default function (pi: ExtensionAPI) {
 			await reply(`Bridge state (not model usage; sampled without a model turn):\n${JSON.stringify(command?.args === "detail" ? snapshot : summary, null, 2)}`);
 			return;
 		}
-		if (lower === "/telegram_reload") {
+		if (lower === "/reload") {
 			const request = reserveHandoff();
 			await boundedUiCall("sendMessage", { chat_id: firstMessage.chat.id, text: requestText(request.outcome) });
 			if (request.owner) {
@@ -1264,7 +1264,7 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (lower === "/new") {
-			// Same reservation/receipt shape as /telegram_reload: the local command owns
+			// Same reservation/receipt shape as /reload: the local command owns
 			// quiescing and the terminal switch. The confirmation that Telegram survived
 			// comes from the REPLACEMENT instance, addressed by the checkpoint's request.
 			const request = reserveHandoff("new", { chatId: firstMessage.chat.id, messageId: firstMessage.message_id });
