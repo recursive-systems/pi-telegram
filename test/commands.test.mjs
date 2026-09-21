@@ -39,7 +39,7 @@ test('suffixes preserve target checks; unknown commands are honest and never mod
   const h = await harness(t, { config: { botUsername: 'Own_Bot' } });
   for (const cmd of ['/stop@other_bot', '/made_up', '/login', '/skill:foo', '/telegram_reload', '/telegram-reload']) await h.receive(cmd);
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).held, false);
-  assert.match(replies(h), /not executed/); assert.match(replies(h), /safe handoff/);
+  assert.match(replies(h), /not executed/); assert.doesNotMatch(replies(h), /safe handoff/);
   await h.receive('/STOP@oWn_bOt'); assert.equal((await h.diagnostic()).held, true);
   assert.deepEqual(parseTelegramCommand('/compact@Own_Bot Keep CASE\nAnd text', 'own_bot'), { name: 'compact', args: 'Keep CASE\nAnd text' });
 });

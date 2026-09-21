@@ -1236,8 +1236,7 @@ export default function (pi: ExtensionAPI) {
 		if (command?.foreign) { await reply("Command addressed to another or unknown bot; not executed."); return; }
 		const route = command && telegramCommands.find(c => c.command === command.name);
 		if (command && !route) {
-			await reply(command.name === "telegram_reload" ? "/telegram_reload was renamed. Use /reload for a safe handoff."
-				: "Unknown or unavailable Telegram command; not executed or sent to pi. Use /commands.");
+			await reply("Unknown or unavailable Telegram command; not executed or sent to pi. Use /commands.");
 			return;
 		}
 		if (route && command && ((route.args === "" && command.args) ||
