@@ -176,7 +176,7 @@ Send `/commands`, `/help`, or `/start` for help. Implemented remote routes:
 | `/compact [instructions]` | Compact only while Pi is idle; optional instruction text preserves case |
 | `/new` | Start a fresh Pi session and carry the Telegram connection, idle only; queued/held turns refuse it |
 | `/stop` or bare `stop` | Abort and hold queued history |
-| `/telegram_reload` | Request the existing safe runtime handoff, not install/upgrade source |
+| `/reload` | Request the existing safe runtime handoff, not install/upgrade source |
 | `/commands`, `/help`, `/start` | Help and a bounded local-only Pi catalog |
 
 `/model` exists so the session can be moved off an unavailable provider from the
@@ -200,8 +200,8 @@ and `@bot` suffixes are case-insensitive; argument text is not lowercased. An
 addressed command is refused until a bounded (2s), once-per-connection `getMe` verifies the active token username, or if its suffix differs. Configuration is not identity. Explicit disconnect/shutdown invalidates this cache and cancels delayed verification; bare commands do not wait for it. Internal handoff preserves already-verified addressing while accepted ingress drains, so an accepted `/stop@Own_Bot` still holds queued history. A new connection always verifies afresh, including after a failed handoff. Failed verification is not polled again until reconnect.
 Unsupported arguments return usage. **Intentional compatibility change:** unknown
 or unavailable standalone slash commands are explicitly rejected, not silently
-sent to the model. Telegram `/reload` points to `/telegram_reload`; it never runs
-ordinary teardown. These control/help responses do not release stop-held history.
+sent to the model. Telegram `/reload` schedules the safe `/telegram-reload`
+handoff; it never runs ordinary teardown. These control/help responses do not release stop-held history.
 
 `pi.getCommands()` is sampled dynamically for help: up to 12 validated names
 from the first 200 entries (extension, prompt, skill), with visible filtering /
@@ -355,7 +355,7 @@ On Pi **0.85.0**, `/telegram-reload` reloads the **installed runtime**, preservi
 this bridge's prepared FIFO queue and `stop` hold/history. It does **not** install
 new source, upgrade Pi, or change package pins. The `telegram_reload` tool is a
 thin command scheduler: the model must have **explicit user authorization** to
-call it. The paired Telegram `/telegram_reload` alias schedules the same handoff
+call it. The paired Telegram `/reload` alias schedules the same handoff
 without asking a model to translate it. There is no general auto-connect option.
 
 The command blocks new queue dispatch immediately, waits for host idle **and**
@@ -426,8 +426,8 @@ Differences from reload, all deliberate:
   previous file that does not exist is the ordinary silent cold start (Pi only
   creates a session file with its first assistant message, so a local `/new`
   from a fresh session has none). For the same reason a freshly created session
-  must produce an assistant response before another `/new` (or
-  `/telegram_reload`) can be carried; an oversized session file is refused
+  must produce an assistant response before another `/new` (or Telegram
+  `/reload`) can be carried; an oversized session file is refused
   before teardown, so the old session stays connected.
 - **Identity is checked against the old session.** The checkpoint's session
   id/file must be the session that was replaced (`previousSessionFile`), never

@@ -29,7 +29,7 @@ test('registry, scoped menu and help agree; register only at first authorized ch
 for (const extra of [{ from: { id: 8 } }, { chat: { id: 80, type: 'group' } }, { from: { id: 7, is_bot: true } }]) {
   test('authorization before parsing/menu ' + JSON.stringify(extra), async t => {
     const h = await harness(t);
-    await h.receive('/telegram_reload', extra);
+    await h.receive('/reload', extra);
     assert.equal(h.generation, 1); assert.equal(h.submissions.length, 0);
     assert.equal(h.network.some(n => n.method === 'setMyCommands'), false);
   });
@@ -37,14 +37,14 @@ for (const extra of [{ from: { id: 8 } }, { chat: { id: 80, type: 'group' } }, {
 
 test('suffixes preserve target checks; unknown commands are honest and never model prompts', async t => {
   const h = await harness(t, { config: { botUsername: 'Own_Bot' } });
-  for (const cmd of ['/stop@other_bot', '/made_up', '/login', '/skill:foo', '/reload', '/telegram-reload']) await h.receive(cmd);
+  for (const cmd of ['/stop@other_bot', '/made_up', '/login', '/skill:foo', '/telegram_reload', '/telegram-reload']) await h.receive(cmd);
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).held, false);
-  assert.match(replies(h), /not executed/); assert.match(replies(h), /safe handoff/);
+  assert.match(replies(h), /not executed/); assert.doesNotMatch(replies(h), /safe handoff/);
   await h.receive('/STOP@oWn_bOt'); assert.equal((await h.diagnostic()).held, true);
   assert.deepEqual(parseTelegramCommand('/compact@Own_Bot Keep CASE\nAnd text', 'own_bot'), { name: 'compact', args: 'Keep CASE\nAnd text' });
 });
 test('unknown own username refuses addressed commands', async t => {
-  const h = await harness(t); await h.receive('/telegram_reload@Own_Bot');
+  const h = await harness(t); await h.receive('/reload@Own_Bot');
   assert.equal(h.submissions.length, 0); assert.match(replies(h), /unknown bot/);
 });
 
@@ -63,13 +63,13 @@ test('argument validation, compact custom instructions and busy guard', async t 
 test('captions, albums and text with attachments remain normal FIFO input, not control', async t => {
   const h = await harness(t); await h.start('local');
   await h.receive(undefined, { caption: '/stop', document: { file_id: 'file', file_name: 'note.txt' } });
-  await h.receive('/telegram_reload', { photo: [{ file_id: 'image' }] });
+  await h.receive('/reload', { photo: [{ file_id: 'image' }] });
   await h.receive(undefined, { caption: '/commands', media_group_id: 'a', document: { file_id: 'album', file_name: 'album.txt' } });
   t.mock.timers.tick(1200); await tick();
   assert.equal((await h.diagnostic()).held, false); assert.equal(h.submissions.length, 0);
   await h.end(); await h.settle(); await until(() => h.sent.length === 1);
   assert.match(text(h.sent[0]), /\/stop/); assert.match(text(h.sent[0]), /note.txt/);
-  await h.start(); await h.end(); await h.settle(); await until(() => h.sent.length === 2); assert.match(text(h.sent[1]), /telegram_reload/);
+  await h.start(); await h.end(); await h.settle(); await until(() => h.sent.length === 2); assert.match(text(h.sent[1]), /\/reload/);
   assert.equal(h.sent[1].filter(p => p.type === 'image').length, 1);
   await h.start(); await h.end(); await h.settle(); await until(() => h.sent.length === 3); assert.match(text(h.sent[2]), /album.txt/);
 });
@@ -108,7 +108,7 @@ for (const mode of ['failure', 'hang', 'shutdown']) test('optional menu ' + mode
 });
 
 test('safe alias invoked inside polling ingress completes without deadlock or a model turn', async t => {
-  const h = await harness(t); await h.receive('/telegram_reload');
+  const h = await harness(t); await h.receive('/reload');
   await until(() => h.generation === 2 && h.polling); assert.equal(h.sent.length, 0); assert.equal(h.maxPolls, 1);
   assert.match(replies(h), /Requested/); assert.match(replies(h), /not an admission or reconnection/);
   assert.equal(h.errors.length, 0);
@@ -118,7 +118,7 @@ test('active alias coalesces and preserves final reply/files before FIFO replace
   const h = await harness(t); await h.receive('current'); await h.start();
   const path = join(h.home, 'out.txt'); await writeFile(path, 'fake'); await h.attach([path]);
   await h.receive('queued file', { document: { file_id: 'file', file_name: 'in.txt' } }); await h.receive('last');
-  await h.receive('/telegram_reload'); await h.receive('/telegram_reload');
+  await h.receive('/reload'); await h.receive('/reload');
   assert.equal(h.submissions.filter(s => s.content === '/telegram-reload').length, 1);
   const gate = deferred(); let sending = false;
   h.networkGate = async method => { if (method === 'sendDocument') { sending = true; await gate.promise; } };
@@ -134,26 +134,26 @@ test('alias while already finalizing waits for outbound barrier', async t => {
   const gate = deferred(); let sending = false;
   h.networkGate = async (method, body) => { if (method === 'sendMessage' && body.text === 'final') { sending = true; await gate.promise; } };
   await h.end('final'); const settling = h.settle(); await until(() => sending);
-  await h.receive('/telegram_reload'); assert.equal(h.generation, 1);
+  await h.receive('/reload'); assert.equal(h.generation, 1);
   gate.resolve(); await settling; await until(() => h.generation === 2); assert.equal(h.maxPolls, 1);
 });
 
 test('alias preserves stop-held history through replacement', async t => {
   const h = await harness(t); await h.start('local'); await h.receive('held'); await h.receive('stop');
-  await h.receive('/telegram_reload'); await h.end(); await h.settle(); await until(() => h.generation === 2 && h.polling);
+  await h.receive('/reload'); await h.end(); await h.settle(); await until(() => h.generation === 2 && h.polling);
   assert.equal(h.sent.length, 0); assert.equal((await h.diagnostic()).held, true);
   await h.receive('/commands'); assert.equal(h.sent.length, 0); await h.receive('release'); assert.match(text(h.sent[0]), /held/);
 });
 
 for (const source of ['alias', 'tool']) test('synchronous reload submission failure releases pending reservation: ' + source, async t => {
   const h = await harness(t, { commandSubmission: 'throw' });
-  if (source === 'alias') await h.receive('/telegram_reload'); else assert.equal((await h.reloadTool()).details.outcome, 'refused');
+  if (source === 'alias') await h.receive('/reload'); else assert.equal((await h.reloadTool()).details.outcome, 'refused');
   assert.equal((await h.diagnostic()).reloadPending, false); assert.equal((await h.diagnostic()).failedIngress, 0);
   await h.receive('after failure'); assert.equal(h.sent.length, 1);
 });
 
 test('unknown asynchronous command admission remains requested, held, never claims success', async t => {
-  const h = await harness(t, { commandSubmission: 'swallow' }); await h.receive('/telegram_reload'); await h.receive('queued');
+  const h = await harness(t, { commandSubmission: 'swallow' }); await h.receive('/reload'); await h.receive('queued');
   assert.equal((await h.diagnostic()).reloadPending, true); assert.equal(h.sent.length, 0); assert.equal(h.generation, 1);
   assert.match(replies(h), /not an admission/); assert.ok(!/successful|reconnected/.test(replies(h)));
   h.commandSubmission = undefined; await h.command('telegram-reload'); await until(() => h.generation === 2 && h.sent.length === 1);
@@ -162,7 +162,7 @@ test('unknown asynchronous command admission remains requested, held, never clai
 test('hung reload receipt is bounded and does not prevent explicit handoff', async t => {
   const h = await harness(t); const gate = deferred(); let entered = false;
   h.networkGate = async method => { if (method === 'sendMessage') { entered = true; await gate.promise; } };
-  const receiving = h.receive('/telegram_reload'); await until(() => entered); t.mock.timers.tick(2000);
+  const receiving = h.receive('/reload'); await until(() => entered); t.mock.timers.tick(2000);
   await receiving; await until(() => h.generation === 2); gate.resolve(); assert.equal(h.errors.length, 0);
 });
 
@@ -170,7 +170,7 @@ test('reload reservation holds FIFO even while receipt hangs and current run set
   const h = await harness(t); await h.receive('current'); await h.start(); await h.receive('queued');
   const gate = deferred(); let entered = false;
   h.networkGate = async (method, body) => { if (method === 'sendMessage' && body.text.startsWith('Requested')) { entered = true; await gate.promise; } };
-  const receiving = h.receive('/telegram_reload'); await until(() => entered);
+  const receiving = h.receive('/reload'); await until(() => entered);
   await h.end('final'); await h.settle(); await tick();
   assert.equal(h.sent.length, 1); assert.equal((await h.diagnostic()).reloadPending, true);
   t.mock.timers.tick(2000); gate.resolve(); await receiving; await until(() => h.generation === 2 && h.sent.length === 2);
@@ -178,7 +178,7 @@ test('reload reservation holds FIFO even while receipt hangs and current run set
 });
 
 for (const field of ['business_connection_id', 'guest_query_id']) test('alternate chat context does not target ordinary private menu: ' + field, async t => {
-  const h = await harness(t); await h.receive('/telegram_reload', { [field]: 'alternate' });
+  const h = await harness(t); await h.receive('/reload', { [field]: 'alternate' });
   assert.equal(h.submissions.length, 0); assert.equal(h.network.some(n => n.method === 'setMyCommands'), false);
 });
 
@@ -200,7 +200,7 @@ test('stale configured A identity never controls verified B token', async t => {
 test('explicit disconnect cancels delayed remote reservation', async t => {
   const h = await harness(t); const gate = deferred(); let entered = false;
   h.networkGate = async (method, body) => { if (method === 'sendMessage' && body.text.startsWith('Requested')) { entered = true; await gate.promise; } };
-  h.push('/telegram_reload'); await until(() => entered);
+  h.push('/reload'); await until(() => entered);
   const disconnecting = h.command('telegram-disconnect'); gate.resolve(); await disconnecting; await tick();
   assert.equal(h.submissions.length, 0); assert.equal(h.generation, 1); assert.equal(h.polling, false);
   assert.equal((await h.diagnostic()).reloadPending, false);
@@ -208,7 +208,7 @@ test('explicit disconnect cancels delayed remote reservation', async t => {
 
 test('foreign reload catalog refuses submission rather than prompt fallthrough', async t => {
   const h = await harness(t, { reloadCatalog: [{ name: 'telegram-reload:1', source: 'extension', sourceInfo: { path: '/foreign' } }] });
-  await h.receive('/telegram_reload'); assert.equal(h.submissions.length, 0); assert.equal(h.sent.length, 0);
+  await h.receive('/reload'); assert.equal(h.submissions.length, 0); assert.equal(h.sent.length, 0);
   assert.match(replies(h), /refused/i);
 });
 
@@ -235,7 +235,7 @@ for (const callback of ['onComplete', 'onError']) test('compact ' + callback + '
 });
 
 test('throwing catalog preserves help and refuses both schedulers', async t => {
-  const h = await harness(t, { catalogThrows: true }); await h.receive('/help'); await h.receive('/telegram_reload');
+  const h = await harness(t, { catalogThrows: true }); await h.receive('/help'); await h.receive('/reload');
   assert.equal((await h.reloadTool()).details.outcome, 'refused'); assert.equal(h.submissions.length, 0); assert.ok(!replies(h).includes('SECRET'));
 });
 
@@ -263,13 +263,13 @@ test('disconnect after connected snapshot during persisted-file await cancels ha
 test('catalog can change during receipt: cancel only own reservation and preserve stop hold', async t => {
   const h = await harness(t); await h.receive('/stop'); const gate = deferred(); let entered = false;
   h.networkGate = async (method, body) => { if (method === 'sendMessage' && body.text.startsWith('Requested')) { entered = true; await gate.promise; } };
-  const receiving = h.receive('/telegram_reload'); await until(() => entered);
+  const receiving = h.receive('/reload'); await until(() => entered);
   h.discovered = [{ name: 'telegram-reload', source: 'extension', sourceInfo: { path: '/foreign' } }];
   gate.resolve(); await receiving;
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).reloadPending, false); assert.equal((await h.diagnostic()).held, true);
 });
 
-for (const control of ['/telegram_reload', '/stop', '/compact']) test('disconnect during cursor commit revokes later controls, not already-recorded safety stop ' + control, async t => {
+for (const control of ['/reload', '/stop', '/compact']) test('disconnect during cursor commit revokes later controls, not already-recorded safety stop ' + control, async t => {
   const h = await harness(t); const gate = deferred(); let entered = false;
   h.configWrite = async () => { entered = true; await gate.promise; };
   h.push(control); await until(() => entered);
@@ -288,7 +288,7 @@ for (const boundary of ['pairing-write', 'pairing-reply']) test('origin intent s
   h.networkGate = async (method, body) => {
     if (boundary === 'pairing-reply' && method === 'sendMessage' && body.text.includes('paired')) { entered = true; await gate.promise; }
   };
-  h.push('/telegram_reload'); await until(() => entered);
+  h.push('/reload'); await until(() => entered);
   const disconnecting = h.command('telegram-disconnect'); gate.resolve(); await disconnecting; await tick();
   assert.equal(h.submissions.length, 0); assert.equal(h.entries.length, 0); assert.equal(h.polling, false);
   assert.equal(h.network.filter(n => n.method === 'setMyCommands').length, 0);
