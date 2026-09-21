@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, realpathSync, readdirSync } from "node:fs";
+import { createReadStream, existsSync, mkdirSync, realpathSync, readdirSync } from "node:fs";
 import { AdmissionStore, type AdmissionInput, type AdmissionPhase, type TelegramMediaReference } from "./admission-store.ts";
 import { AdmissionLease } from "./admission-lease.ts";
 import { ContinuationStore, inspectContinuationRecords } from "./continuation-store.ts";
@@ -8,12 +8,13 @@ import { execFile } from "node:child_process";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
+import { createInterface } from "node:readline";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Type } from "@sinclair/typebox";
 
 import { telegramCommands, parseTelegramCommand, telegramHelp } from "./telegram-commands.ts";
@@ -182,14 +183,20 @@ interface TelegramMediaGroupState {
 
 // Only a live, one-shot capability can authorize restoration. Session entries alone
 // (including copied/forked entries) never authorize a connection. No credentials here.
+// Two handoff kinds share this shape and the same permit rules:
+//   "telegram-reload" — same session, entry read from THIS session's entries;
+//   "telegram-new"    — session replacement, entry stays in the OLD session file and
+//                       is read from `session_start.previousSessionFile` on disk.
 interface ReloadCheckpoint {
 	admission?: { scope: string; generation: number; stopLatched: boolean };
 	bridgeEpoch?: string;
 	version: 1;
-	reason: "telegram-reload";
+	reason: HandoffReason;
 	nonce: string;
 	sessionId: string;
 	sessionFile: string;
+	/** Only for "telegram-new": where the replacement instance addresses its confirmation. */
+	request?: { chatId: number; messageId: number };
 	configDigest: string;
 	connected: boolean;
 	cursor?: number;
@@ -198,11 +205,19 @@ interface ReloadCheckpoint {
 	turns: PendingTelegramTurn[];
 }
 interface ReloadPermit { digest: string; armed: boolean; expires: number }
+type HandoffKind = "reload" | "new";
+type HandoffReason = "telegram-reload" | "telegram-new";
+const handoffReason = (kind: HandoffKind): HandoffReason => kind === "new" ? "telegram-new" : "telegram-reload";
+const handoffCommand = (kind: HandoffKind): string => kind === "new" ? "telegram-new" : "telegram-reload";
 const reloadKey = Symbol.for("pi-telegram.explicit-reload.v1");
 const processState = globalThis as typeof globalThis & { [reloadKey]?: { key: string; permits: Map<string, ReloadPermit> } };
 const reloadState = processState[reloadKey] ??= { key: randomUUID(), permits: new Map() };
 const CHECKPOINT_TYPE = "telegram-reload-checkpoint-v1";
 const CLAIM_TYPE = "telegram-reload-claim-v1";
+// Bounds for reading a checkpoint back out of the PREVIOUS session file ("new" only).
+// A session log that cannot be scanned cheaply refuses the handoff instead of guessing.
+const MAX_PREVIOUS_SESSION_BYTES = 64 * 1024 * 1024;
+const MAX_CHECKPOINT_LINE_BYTES = 9 * 1024 * 1024;
 const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
 const configDigest = (config: TelegramConfig) => createHmac("sha256", reloadState.key)
 	.update(JSON.stringify([config.botToken, config.botId, config.botUsername, config.allowedUserId])).digest("hex");
@@ -362,6 +377,33 @@ async function readConfig(): Promise<TelegramConfig> {
 	}
 }
 
+/**
+ * Read the LAST handoff checkpoint out of a previous session's JSONL file.
+ *
+ * A replacement session starts with no entries, so the `/new` handoff must read the
+ * old file. This is evidence only: it never authorizes anything by itself. The live
+ * one-shot permit (digest + nonce + expiry, armed only by this process's own
+ * `session_shutdown`) remains the sole capability, so an old checkpoint left on disk
+ * can never re-arm a connection. Bounded: oversized files/lines and a truncated or
+ * unparsable checkpoint line refuse rather than scan unboundedly or guess.
+ */
+async function readPreviousCheckpoint(sessionFile: string): Promise<ReloadCheckpoint | undefined> {
+	const info = await stat(sessionFile);
+	if (!info.isFile() || info.size > MAX_PREVIOUS_SESSION_BYTES) throw new Error("previous session file unusable");
+	const input = createReadStream(sessionFile, { encoding: "utf8" });
+	try {
+		let found: ReloadCheckpoint | undefined;
+		for await (const line of createInterface({ input, crlfDelay: Infinity })) {
+			// Cheap prefilter only; matching text is never a permission decision.
+			if (!line.includes(CHECKPOINT_TYPE)) continue;
+			if (line.length > MAX_CHECKPOINT_LINE_BYTES) throw new Error("checkpoint entry too large");
+			const entry = JSON.parse(line) as { type?: string; customType?: string; data?: ReloadCheckpoint };
+			if (entry?.type === "custom" && entry.customType === CHECKPOINT_TYPE) found = entry.data;
+		}
+		return found;
+	} finally { input.destroy(); }
+}
+
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
 	let bridgeEpoch: string = randomUUID();
@@ -372,6 +414,10 @@ export default function (pi: ExtensionAPI) {
 	let reloadPending = false;
 	let connectionIntent = 0;
 	let reservation: symbol | undefined;
+	// Which handoff the current reservation/run is for, and where a "new" handoff's
+	// replacement instance should address its confirmation. Plain data only.
+	let handoffKind: HandoffKind = "reload";
+	let pendingHandoffRequest: { chatId: number; messageId: number } | undefined;
 	let verifiedUsername: string | undefined;
 	let verifiedToken: string | undefined;
 	let identityController: AbortController | undefined;
@@ -1206,12 +1252,27 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (lower === "/telegram_reload") {
-			const request = reserveReload();
+			const request = reserveHandoff();
 			await boundedUiCall("sendMessage", { chat_id: firstMessage.chat.id, text: requestText(request.outcome) });
 			if (request.owner) {
-				const outcome = submitReload(ctx, request.owner);
+				const outcome = submitHandoff(ctx, request.owner);
 				if (outcome === "refused" && !closed) await boundedUiCall("sendMessage", {
 					chat_id: firstMessage.chat.id, text: requestText(outcome),
+				});
+			}
+			return; // NEVER await command completion: it awaits this polling ingress.
+		}
+
+		if (lower === "/new") {
+			// Same reservation/receipt shape as /telegram_reload: the local command owns
+			// quiescing and the terminal switch. The confirmation that Telegram survived
+			// comes from the REPLACEMENT instance, addressed by the checkpoint's request.
+			const request = reserveHandoff("new", { chatId: firstMessage.chat.id, messageId: firstMessage.message_id });
+			await boundedUiCall("sendMessage", { chat_id: firstMessage.chat.id, text: requestText(request.outcome, "new") });
+			if (request.owner) {
+				const outcome = submitHandoff(ctx, request.owner, "new");
+				if (outcome === "refused" && !closed) await boundedUiCall("sendMessage", {
+					chat_id: firstMessage.chat.id, text: requestText(outcome, "new"),
 				});
 			}
 			return; // NEVER await command completion: it awaits this polling ingress.
@@ -1818,9 +1879,16 @@ export default function (pi: ExtensionAPI) {
 		drainTelegramQueue(ctx);
 	}
 
-	function refuseReload(ctx: ExtensionContext): boolean {
+	function refuseReload(ctx: ExtensionContext, kind: HandoffKind = "reload"): boolean {
 		if (inboxFault || coldIncoming.size || uncertainReply || submittedTelegramTurn || queuedTelegramTurns.some(turn => !!turn.continuation) || preflightPending || failedPreparations.length || failedIngress.length || setupInProgress) {
-			ctx.ui.notify("Telegram reload refused: unacknowledged/preflight, uncertain reply, or failed preparation work. Preserve affected messages before ordinary teardown; no automatic replay.", "error");
+			ctx.ui.notify(`Telegram ${kind === "new" ? "/new" : "reload"} refused: unacknowledged/preflight, uncertain reply, or failed preparation work. Preserve affected messages before ordinary teardown; no automatic replay.`, "error");
+			return true;
+		}
+		// /new deliberately discards context, so queued/held Telegram work must never
+		// ride along or be silently dropped: the admission journal would then disagree
+		// with a turn nobody runs. Refuse instead; the old session keeps the work.
+		if (kind === "new" && (queuedTelegramTurns.length || preserveQueuedTurnsAsHistory)) {
+			ctx.ui.notify("Telegram /new refused: queued or stop-held Telegram turns are never replayed into a fresh session. Let them run (or reconcile them locally) first.", "error");
 			return true;
 		}
 		return false;
@@ -1835,145 +1903,219 @@ export default function (pi: ExtensionAPI) {
 		drainTelegramQueue(ctx);
 	}
 
-	pi.registerCommand("telegram-reload", {
-		description: "Explicit runtime reload with a one-shot Telegram queue handoff (does not upgrade source)",
-		handler: async (_args, ctx) => {
-			if (closed || reloadRunning || recoveryRequired) return;
-			reloadPending = true;
-			reloadRunning = true;
-			reservation = undefined;
-			const intent = connectionIntent;
-			let stopped = false;
-			try {
-				if (refuseReload(ctx)) { releaseUnstartedReload(ctx); return; }
-				await ctx.waitForIdle();
-				if (finalizingReply) await new Promise<void>(resolve => replyWaiters.push(resolve));
-				if (closed) return;
-				if (intent !== connectionIntent) throw new Error("connection intent changed");
-				if (refuseReload(ctx) || activeTelegramTurn || !ctx.isIdle() || ctx.hasPendingMessages())
-					throw new Error("not safe");
-				const connected = !!pollingPromise;
-				if (connected && config.lastUpdateId === undefined) throw new Error("initial polling cursor not ready");
-				const sessionId = ctx.sessionManager.getSessionId();
-				const sessionFile = ctx.sessionManager.getSessionFile();
-				if (!sessionFile) throw new Error("persistent session required");
-				// Pi can allocate a filename before its first assistant message flushes
-				// anything. Don't promise file-based recovery for an in-memory-only log.
-				const persisted = await stat(sessionFile).then(info => info.isFile(), () => false);
-				if (closed) return;
-				if (intent !== connectionIntent) throw new Error("connection intent changed");
-				if (!persisted) {
-					releaseUnstartedReload(ctx);
-					ctx.ui.notify("Telegram reload refused: session file is not persisted yet. Let Pi save an assistant response before retrying; queued work remains in this instance.", "error");
-					return;
-				}
-				// Abort ONLY polling, not the session signal used by ingress/downloads/replies.
-				stopped = true;
-				// If handoff fails after quiescing, unrelated idle events must not
-				// silently run a disconnected queue. Explicit connect releases it.
-				restoredDisconnected = true;
-				await stopPolling(true);
-				for (const state of mediaGroups.values()) {
-					if (state.flushTimer) clearTimeout(state.flushTimer);
-					state.ready();
-				}
-				mediaGroups.clear();
-				await preparingTurns;
-				if (closed) return;
-				if (intent !== connectionIntent) throw new Error("connection intent changed");
-				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
-					throw new Error("not safe after quiescing");
-				const diskConfig = await loadConfig();
-				if (configDigest(diskConfig) !== configDigest(config) || diskConfig.lastUpdateId !== config.lastUpdateId) throw new Error("config changed");
-				if (closed) return;
-				if (intent !== connectionIntent) throw new Error("connection intent changed");
-				// No async work between this final admission check and snapshot/reload.
-				if (refuseReload(ctx) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
-					throw new Error("not safe after config verification");
-				const snapshot = inbox?.inspect();
-				checkpoint = structuredClone({ ...(snapshot ? { admission: { scope: snapshot.scope, generation: snapshot.generation, stopLatched: snapshot.stopLatched } } : {}), version: 1, reason: "telegram-reload", nonce: randomUUID(), sessionId, sessionFile,
-					configDigest: configDigest(config), bridgeEpoch, connected, cursor: config.lastUpdateId,
-					held: preserveQueuedTurnsAsHistory, stopGeneration, turns: queuedTelegramTurns });
-				// Bound session growth; never silently truncate private text or image inputs.
-				if (Buffer.byteLength(JSON.stringify(checkpoint)) > 8 * 1024 * 1024) throw new Error("checkpoint too large");
-				pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
-				reloadState.permits.set(checkpoint.nonce, { digest: digest(checkpoint), armed: false, expires: Date.now() + 120_000 });
-			} catch {
-				if (closed) return;
-				checkpoint = undefined;
-				if (!stopped) releaseUnstartedReload(ctx);
-				else {
-					reloadRunning = false;
-					reloadPending = false;
-				}
-				ctx.ui.notify(stopped
-					? "Telegram reload stopped before teardown. Queue/evidence retained locally; polling stopped. Resolve the problem and explicitly retry /telegram-reload or /telegram-connect."
-					: "Telegram reload refused before teardown. Work retained; wait for safe idle and retry.", "error");
+	// One quiesce/checkpoint path for both handoff kinds. Every refusal gate, the
+	// teardown order and the capability rules are identical; only the terminal host
+	// call (ctx.reload vs ctx.newSession), the checkpoint reason, and what the
+	// replacement instance is allowed to restore differ.
+	async function runHandoff(kind: HandoffKind, ctx: ExtensionCommandContext): Promise<void> {
+		if (closed || reloadRunning || recoveryRequired) return;
+		// Only a reservation made for THIS kind may address a Telegram receipt.
+		const requestOrigin = handoffKind === kind ? pendingHandoffRequest : undefined;
+		pendingHandoffRequest = undefined;
+		handoffKind = kind;
+		reloadPending = true;
+		reloadRunning = true;
+		reservation = undefined;
+		const intent = connectionIntent;
+		let stopped = false;
+		// A remotely requested /new that refuses must say so in Telegram: the requester
+		// cannot see local notices, and after quiescing the bridge is disconnected.
+		// Bounded and best-effort; it is a report, never part of the decision.
+		const reportRefusal = async (text: string): Promise<void> => {
+			if (kind !== "new" || !requestOrigin || closed || intent !== connectionIntent) return;
+			await boundedUiCall("sendMessage", { chat_id: requestOrigin.chatId, text });
+		};
+		try {
+			if (refuseReload(ctx, kind)) {
+				releaseUnstartedReload(ctx);
+				await reportRefusal("New session refused: this bridge has queued, held or unreconciled Telegram work. /new never replays it. Let it finish or reconcile it locally, then retry.");
 				return;
 			}
-			// Terminal: failures after runtime invalidation are reported by the host, not
-			// through captured stale pi/ctx. The immutable checkpoint remains in the session.
-			const reloadNonce = checkpoint?.nonce;
-			try { await ctx.reload(); }
-			catch {
-				if (!closed) {
-					reloadRunning = false;
-					reloadPending = false;
-					ctx.ui.notify("Telegram runtime reload failed before shutdown; queue retained and polling stopped. Explicit retry required.", "error");
-					return;
-				}
-				// The host error channel owns reporting after teardown; no stale API calls.
-				throw new Error("Telegram runtime reload failed after teardown. Private session checkpoint retained; reconcile work manually before reconnecting.");
-			} finally {
-				// TUI reload/import failures can be diagnostics with a resolved promise.
-				// The capability belongs only to THIS operation, never a later /reload.
-				if (reloadNonce) reloadState.permits.delete(reloadNonce);
-				if (!closed && reloadRunning) {
-					reloadRunning = false;
-					reloadPending = false;
-					ctx.ui.notify("Telegram runtime was not replaced; queue retained and polling stopped. Explicit retry required.", "error");
-				}
+			await ctx.waitForIdle();
+			if (finalizingReply) await new Promise<void>(resolve => replyWaiters.push(resolve));
+			if (closed) return;
+			if (intent !== connectionIntent) throw new Error("connection intent changed");
+			if (refuseReload(ctx, kind) || activeTelegramTurn || !ctx.isIdle() || ctx.hasPendingMessages())
+				throw new Error("not safe");
+			const connected = !!pollingPromise;
+			if (connected && config.lastUpdateId === undefined) throw new Error("initial polling cursor not ready");
+			const sessionId = ctx.sessionManager.getSessionId();
+			const sessionFile = ctx.sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("persistent session required");
+			// Pi can allocate a filename before its first assistant message flushes
+			// anything. Don't promise file-based recovery for an in-memory-only log.
+			const info = await stat(sessionFile).catch(() => undefined);
+			const persisted = info?.isFile() === true;
+			if (closed) return;
+			if (intent !== connectionIntent) throw new Error("connection intent changed");
+			// The replacement reads the checkpoint back with the same bound; refuse here,
+			// before teardown, rather than after the switch has already discarded context.
+			if (kind === "new" && persisted && info!.size > MAX_PREVIOUS_SESSION_BYTES) {
+				releaseUnstartedReload(ctx);
+				ctx.ui.notify("Telegram /new refused: this session file is too large for the replacement to read its handoff checkpoint. Use /compact, or run a local /new and reconnect with /telegram-connect.", "error");
+				await reportRefusal("New session refused: previous session file too large to carry the Telegram connection. Use /compact or reconnect locally with /telegram-connect after a local /new.");
+				return;
 			}
+			if (!persisted) {
+				releaseUnstartedReload(ctx);
+				ctx.ui.notify(kind === "new"
+					? "Telegram /new refused: this session file is not persisted yet, so the replacement could not read its handoff checkpoint. Let Pi save an assistant response before retrying."
+					: "Telegram reload refused: session file is not persisted yet. Let Pi save an assistant response before retrying; queued work remains in this instance.", "error");
+				await reportRefusal("New session refused: this Pi session has not been saved to disk yet, so a handoff cannot be carried. Let Pi save an assistant response, then retry.");
+				return;
+			}
+			// Abort ONLY polling, not the session signal used by ingress/downloads/replies.
+			stopped = true;
+			// If handoff fails after quiescing, unrelated idle events must not
+			// silently run a disconnected queue. Explicit connect releases it.
+			restoredDisconnected = true;
+			await stopPolling(true);
+			for (const state of mediaGroups.values()) {
+				if (state.flushTimer) clearTimeout(state.flushTimer);
+				state.ready();
+			}
+			mediaGroups.clear();
+			await preparingTurns;
+			if (closed) return;
+			if (intent !== connectionIntent) throw new Error("connection intent changed");
+			if (refuseReload(ctx, kind) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
+				throw new Error("not safe after quiescing");
+			const diskConfig = await loadConfig();
+			if (configDigest(diskConfig) !== configDigest(config) || diskConfig.lastUpdateId !== config.lastUpdateId) throw new Error("config changed");
+			if (closed) return;
+			if (intent !== connectionIntent) throw new Error("connection intent changed");
+			// No async work between this final admission check and snapshot/reload.
+			if (refuseReload(ctx, kind) || activeTelegramTurn || finalizingReply || !ctx.isIdle() || ctx.hasPendingMessages())
+				throw new Error("not safe after config verification");
+			const snapshot = inbox?.inspect();
+			// sessionId/sessionFile always name the OLD session: for "new" they are what
+			// the replacement must see as session_start.previousSessionFile.
+			checkpoint = structuredClone({ ...(snapshot ? { admission: { scope: snapshot.scope, generation: snapshot.generation, stopLatched: snapshot.stopLatched } } : {}), version: 1, reason: handoffReason(kind), nonce: randomUUID(), sessionId, sessionFile,
+				...(kind === "new" && requestOrigin ? { request: { ...requestOrigin } } : {}),
+				configDigest: configDigest(config), bridgeEpoch, connected, cursor: config.lastUpdateId,
+				held: preserveQueuedTurnsAsHistory, stopGeneration, turns: queuedTelegramTurns });
+			// Bound session growth; never silently truncate private text or image inputs.
+			if (Buffer.byteLength(JSON.stringify(checkpoint)) > 8 * 1024 * 1024) throw new Error("checkpoint too large");
+			pi.appendEntry(CHECKPOINT_TYPE, checkpoint);
+			reloadState.permits.set(checkpoint.nonce, { digest: digest(checkpoint), armed: false, expires: Date.now() + 120_000 });
+		} catch {
+			if (closed) return;
+			checkpoint = undefined;
+			if (!stopped) releaseUnstartedReload(ctx);
+			else {
+				reloadRunning = false;
+				reloadPending = false;
+			}
+			ctx.ui.notify(stopped
+				? `Telegram ${kind === "new" ? "/new" : "reload"} stopped before teardown. Queue/evidence retained locally; polling stopped. Resolve the problem and explicitly retry /telegram-${kind === "new" ? "new" : "reload"} or /telegram-connect.`
+				: `Telegram ${kind === "new" ? "/new" : "reload"} refused before teardown. Work retained; wait for safe idle and retry.`, "error");
+			await reportRefusal(stopped
+				? "New session refused before teardown; this session is unchanged and its Telegram polling is now stopped. Reconnect locally with /telegram-connect."
+				: "New session refused before teardown; this session and its Telegram work are unchanged. Wait for a safe idle moment and retry.");
 			return;
-		},
+		}
+		// Terminal: failures after runtime invalidation are reported by the host, not
+		// through captured stale pi/ctx. The immutable checkpoint remains in the session.
+		const reloadNonce = checkpoint?.nonce;
+		const parentSession = checkpoint?.sessionFile;
+		let cancelled = false;
+		try {
+			// Another extension may veto the switch in session_before_switch; then no
+			// shutdown happened, this instance is still live and stays disconnected.
+			if (kind === "new") {
+				cancelled = (await ctx.newSession({ parentSession }))?.cancelled === true;
+				if (cancelled) await reportRefusal("New session cancelled locally before any change; this session is unchanged and its Telegram polling is stopped. Reconnect with /telegram-connect.");
+			} else await ctx.reload();
+		}
+		catch {
+			if (!closed) {
+				reloadRunning = false;
+				reloadPending = false;
+				ctx.ui.notify(kind === "new"
+					? "Telegram /new failed before session replacement; polling stopped and the checkpoint is retained. Explicit /telegram-connect required."
+					: "Telegram runtime reload failed before shutdown; queue retained and polling stopped. Explicit retry required.", "error");
+				await reportRefusal("New session failed before replacement; this session is unchanged and its Telegram polling is stopped. Reconnect with /telegram-connect.");
+				return;
+			}
+			// The host error channel owns reporting after teardown; no stale API calls.
+			throw new Error(kind === "new"
+				? "Telegram session replacement failed after teardown. Private session checkpoint retained; reconnect explicitly with /telegram-connect after reconciling."
+				: "Telegram runtime reload failed after teardown. Private session checkpoint retained; reconcile work manually before reconnecting.");
+		} finally {
+			// TUI reload/import failures can be diagnostics with a resolved promise.
+			// The capability belongs only to THIS operation, never a later /reload or /new.
+			if (reloadNonce) reloadState.permits.delete(reloadNonce);
+			if (!closed && reloadRunning) {
+				reloadRunning = false;
+				reloadPending = false;
+				ctx.ui.notify(cancelled
+					? "Telegram /new was cancelled by another extension; this session is unchanged, polling stopped and the checkpoint retained. Use /telegram-connect to reconnect here."
+					: kind === "new"
+						? "Telegram session was not replaced; polling stopped and the checkpoint retained. Explicit /telegram-connect required."
+						: "Telegram runtime was not replaced; queue retained and polling stopped. Explicit retry required.", "error");
+				// Cancellation already reported itself above; a silent non-replacement has not.
+				if (!cancelled) await reportRefusal("New session failed before replacement; this session is unchanged and its Telegram polling is stopped. Reconnect with /telegram-connect.");
+			}
+		}
+		return;
+	}
+
+	pi.registerCommand("telegram-reload", {
+		description: "Explicit runtime reload with a one-shot Telegram queue handoff (does not upgrade source)",
+		handler: async (_args, ctx) => { await runHandoff("reload", ctx); },
+	});
+
+	pi.registerCommand("telegram-new", {
+		description: "Start a fresh Pi session and carry the Telegram connection with a one-shot handoff (idle only, never replays queued turns)",
+		handler: async (_args, ctx) => { await runHandoff("new", ctx); },
 	});
 
 	// Catalog and dispatch are separate host operations. Refuse ambiguity, including
 	// duplicate namespaces; never infer ownership from a description or name alone.
-	function reloadCallable(): boolean {
+	function handoffCallable(name: string): boolean {
 		try {
 			const commands = pi.getCommands();
-			const candidates = commands.filter(c => c.name === "telegram-reload" || c.name.startsWith("telegram-reload:"));
-			return candidates.length === 1 && candidates[0].name === "telegram-reload" &&
+			const candidates = commands.filter(c => c.name === name || c.name.startsWith(`${name}:`));
+			return candidates.length === 1 && candidates[0].name === name &&
 				candidates[0].source === "extension" && candidates[0].sourceInfo?.path === fileURLToPath(new URL("./index.ts", import.meta.url));
 		} catch { return false; }
 	}
 	type RequestOutcome = "requested" | "coalesced" | "refused";
-	function requestText(outcome: RequestOutcome): string {
+	function requestText(outcome: RequestOutcome, kind: HandoffKind = "reload"): string {
+		if (kind === "new") return outcome === "requested"
+			? "Requested /telegram-new submission (receipt only, not proof). If admitted, the replacement session reports back here; queued or held turns refuse the handoff instead of being replayed."
+			: outcome === "coalesced" ? "A Telegram handoff is already pending; /new was not submitted. Admission and completion remain unknown; check locally."
+			: "New-session request refused or cancelled; nothing submitted. Check bridge recovery/connection state and command collisions locally.";
 		return outcome === "requested"
 			? "Requested /telegram-reload submission; completion, if admitted, is reported locally. This is not an admission or reconnection acknowledgement."
 			: outcome === "coalesced" ? "Reload already pending; coalesced without another submission. Admission and completion remain unknown."
 			: "Reload request refused or cancelled; nothing submitted. Check bridge recovery/connection state and command collisions locally; use local /telegram-reload only after resolving them.";
 	}
-	function reserveReload(): { outcome: RequestOutcome; owner?: symbol } {
-		if (closed || recoveryRequired || !reloadCallable()) return { outcome: "refused" };
+	// Reservation holds dispatch for whichever handoff kind was asked for; the local
+	// command consumes it. `origin` only addresses a later receipt, never authorizes one.
+	function reserveHandoff(kind: HandoffKind = "reload", origin?: { chatId: number; messageId: number }): { outcome: RequestOutcome; owner?: symbol } {
+		if (closed || recoveryRequired || !handoffCallable(handoffCommand(kind))) return { outcome: "refused" };
 		if (reloadPending || reloadRunning) return { outcome: "coalesced" };
 		reloadPending = true;
+		handoffKind = kind;
+		pendingHandoffRequest = origin;
 		reservation = Symbol();
 		return { outcome: "requested", owner: reservation };
 	}
-	function submitReload(ctx: ExtensionContext, owner: symbol): RequestOutcome {
+	function submitHandoff(ctx: ExtensionContext, owner: symbol, kind: HandoffKind = "reload"): RequestOutcome {
 		if (reservation !== owner) return "refused";
-		if (closed || recoveryRequired || !reloadCallable()) {
+		if (closed || recoveryRequired || !handoffCallable(handoffCommand(kind))) {
 			reservation = undefined;
+			pendingHandoffRequest = undefined;
 			if (!closed) releaseUnstartedReload(ctx);
 			return "refused";
 		}
 		reservation = undefined;
 		try {
-			pi.sendUserMessage("/telegram-reload", { deliverAs: "followUp", expandPromptTemplates: true });
+			pi.sendUserMessage(`/${handoffCommand(kind)}`, { deliverAs: "followUp", expandPromptTemplates: true });
 			return "requested";
 		} catch {
+			pendingHandoffRequest = undefined;
 			if (!closed && !reloadRunning) releaseUnstartedReload(ctx);
 			return "refused";
 		}
@@ -1985,8 +2127,8 @@ export default function (pi: ExtensionAPI) {
 		description: "Schedule /telegram-reload safely after the current turn and Telegram reply. ONLY call with explicit user authorization to reload this runtime. Never reload autonomously. Does not install or upgrade source.",
 		parameters: Type.Object({}),
 		async execute(_id, _params, _signal, _onUpdate, ctx) {
-			const request = reserveReload();
-			const outcome = request.owner ? submitReload(ctx, request.owner) : request.outcome;
+			const request = reserveHandoff();
+			const outcome = request.owner ? submitHandoff(ctx, request.owner) : request.outcome;
 			return { content: [{ type: "text", text: requestText(outcome) }], details: { outcome } };
 		},
 	});
@@ -2127,7 +2269,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			connectionIntent++;
 			restoredDisconnected = true;
-			if (reservation) { reservation = undefined; releaseUnstartedReload(ctx); }
+			if (reservation) { reservation = undefined; pendingHandoffRequest = undefined; releaseUnstartedReload(ctx); }
 			await stopPolling();
 			maybeReleaseLease();
 			updateStatus(ctx);
@@ -2141,39 +2283,66 @@ export default function (pi: ExtensionAPI) {
 		transition("session-start");
 		if (restoreStarted) return;
 		restoreStarted = true;
-		if (event.reason !== "reload") {
+		const kind: HandoffKind | undefined = event.reason === "reload" ? "reload" : event.reason === "new" ? "new" : undefined;
+		const cold = async (notice?: string): Promise<void> => {
 			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			inspectColdContinuations(); updateStatus(ctx);
-			return;
-		}
+			if (notice && !closed) ctx.ui.notify(notice, "info");
+		};
+		if (!kind) { await cold(); return; }
 		const entries = ctx.sessionManager.getEntries();
-		const entry = [...entries].reverse().find(e => e.type === "custom" && e.customType === CHECKPOINT_TYPE);
-		if (!entry || entry.type !== "custom") {
-			config = await loadConfig();
-			await mkdir(TEMP_DIR, { recursive: true });
-			inspectColdContinuations(); updateStatus(ctx);
+		// "reload" keeps the session, so the checkpoint is in these entries. "new" replaces
+		// it: this session has no entries yet and the checkpoint stays in the previous
+		// session file, which is read (bounded) from disk. Reading is evidence gathering
+		// only — nothing is consumed or authorized before the synchronous claim below.
+		let saved: ReloadCheckpoint | undefined;
+		let unreadable = false;
+		if (kind === "reload") {
+			const entry = [...entries].reverse().find(e => e.type === "custom" && e.customType === CHECKPOINT_TYPE);
+			saved = entry?.type === "custom" ? entry.data as ReloadCheckpoint : undefined;
+		} else if (typeof event.previousSessionFile === "string" && event.previousSessionFile) {
+			try { saved = await readPreviousCheckpoint(event.previousSessionFile); }
+			catch (error) {
+				saved = undefined;
+				// Pi creates a session file only on its first assistant message, so an
+				// ordinary local /new from a fresh session has no previous file: that is
+				// absent evidence (silent cold start), not damaged evidence.
+				unreadable = (error as { code?: string })?.code !== "ENOENT";
+			}
+		}
+		if (!saved || typeof saved !== "object" || typeof saved.nonce !== "string") {
+			// Unusable evidence is reported; absent evidence is the ordinary cold start.
+			await cold(unreadable ? "Previous session file could not be read for a Telegram handoff; disconnected. Reconnect explicitly with /telegram-connect if this session should be bridged." : undefined);
 			return;
 		}
-		const saved = entry.data as ReloadCheckpoint;
-		const permit = saved && reloadState.permits.get(saved.nonce);
+		const permit = reloadState.permits.get(saved.nonce);
 		// Claim synchronously before any await, even when validation fails. Retain the
 		// original custom entry forever for deliberate manual recovery, not blind retry.
-		if (saved?.nonce) reloadState.permits.delete(saved.nonce);
+		reloadState.permits.delete(saved.nonce);
+		// A "new" checkpoint names the OLD session: it must be exactly the session this
+		// start replaced, and never the identity of the session restoring it.
+		const identity = kind === "reload"
+			? saved.sessionId === ctx.sessionManager.getSessionId() && saved.sessionFile === ctx.sessionManager.getSessionFile()
+			: saved.sessionFile === event.previousSessionFile && saved.sessionId !== ctx.sessionManager.getSessionId() &&
+				saved.sessionFile !== ctx.sessionManager.getSessionFile();
 		if (!permit || !permit.armed || permit.expires < Date.now() || permit.digest !== digest(saved) ||
-			saved.version !== 1 || saved.reason !== "telegram-reload" || saved.sessionId !== ctx.sessionManager.getSessionId() ||
-			saved.sessionFile !== ctx.sessionManager.getSessionFile() ||
-			entries.some(e => e.type === "custom" && e.customType === CLAIM_TYPE && (e.data as { nonce?: string })?.nonce === saved.nonce)) {
-			config = await loadConfig();
-			await mkdir(TEMP_DIR, { recursive: true });
-			inspectColdContinuations(); updateStatus(ctx);
-			ctx.ui.notify("No valid live Telegram reload handoff; disconnected. Any archived checkpoint remains private session data, not permission to replay it.", "info");
+			saved.version !== 1 || saved.reason !== handoffReason(kind) || !identity ||
+			entries.some(e => e.type === "custom" && e.customType === CLAIM_TYPE && (e.data as { nonce?: string })?.nonce === saved!.nonce)) {
+			await cold(kind === "new"
+				? "No valid live Telegram new-session handoff; disconnected. Any archived checkpoint remains private session data, not permission to replay it."
+				: "No valid live Telegram reload handoff; disconnected. Any archived checkpoint remains private session data, not permission to replay it.");
 			return;
 		}
 		reloadPending = true;
 		recoveryRequired = true;
 		try {
+			// The claim goes into THIS session (for "new" that is the replacement), so the
+			// same nonce can never be claimed twice even if a callback repeats.
 			pi.appendEntry(CLAIM_TYPE, { nonce: saved.nonce });
+			// /new is an explicit request to discard context: it is only ever certified
+			// with nothing queued or held, so restoration can never resurrect a turn.
+			if (kind === "new" && (!Array.isArray(saved.turns) || saved.turns.length || saved.held)) throw new Error("new-session checkpoint carries queued work");
 			config = await loadConfig();
 			await mkdir(TEMP_DIR, { recursive: true });
 			if (saved.configDigest !== configDigest(config) || saved.cursor !== config.lastUpdateId) throw new Error("config mismatch");
@@ -2216,8 +2385,20 @@ export default function (pi: ExtensionAPI) {
 			reloadPending = false;
 			if (saved.connected) await startPolling(ctx);
 			if (closed) return;
-			ctx.ui.notify(saved.connected ? "Telegram handoff restored; API verified, polling started (future network failures remain possible)."
-				: "Telegram handoff restored; bridge remains disconnected.", "info");
+			ctx.ui.notify(kind === "new"
+				? (saved.connected ? "New Pi session started; Telegram handoff restored, API verified, polling started (future network failures remain possible)."
+					: "New Pi session started; Telegram handoff restored but the bridge remains disconnected.")
+				: (saved.connected ? "Telegram handoff restored; API verified, polling started (future network failures remain possible)."
+					: "Telegram handoff restored; bridge remains disconnected."), "info");
+			// Best-effort receipt from the REPLACEMENT instance (never the stale old ctx).
+			// Delivery failure is a local status notice, not a restoration failure.
+			if (kind === "new" && saved.connected && saved.request &&
+				Number.isSafeInteger(saved.request.chatId) && Number.isSafeInteger(saved.request.messageId)) {
+				const { chatId, messageId } = saved.request;
+				try { await sendTextReply(chatId, messageId, "New session started; Telegram reconnected. Previous context is not carried over."); }
+				catch { if (!closed) updateStatus(ctx, "new-session confirmation not delivered"); }
+				if (closed) return;
+			}
 			drainTelegramQueue(ctx);
 		} catch {
 			if (closed) return;
@@ -2229,7 +2410,9 @@ export default function (pi: ExtensionAPI) {
 		if (closed) { maybeReleaseLease(); return; }
 		if (checkpoint) {
 			const permit = reloadState.permits.get(checkpoint.nonce);
-			if (permit) permit.armed = event.reason === "reload";
+			// Arm ONLY for the shutdown kind this checkpoint was written for: a reload
+			// checkpoint never survives /new, and a /new checkpoint never survives a reload.
+			if (permit) permit.armed = checkpoint.reason === "telegram-new" ? event.reason === "new" : event.reason === "reload";
 		}
 		closed = true;
 		for (const unsubscribe of originSubscriptions.splice(0)) unsubscribe();

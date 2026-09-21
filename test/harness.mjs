@@ -47,8 +47,12 @@ export async function harness(t, options = {}) {
   const compactions = [];
   const identityUsername = options.identity ?? options.config?.botUsername;
   let discovered = options.discovered ?? [], commandSubmission = options.commandSubmission, userSubmission = options.userSubmission;
-  const sent = [], network = [], statuses = [], errors = [], notices = [], entries = [], submissions = [], lifecycle = [], serverUpdates = [];
+  const sent = [], network = [], statuses = [], errors = [], notices = [], submissions = [], lifecycle = [], serverUpdates = [];
+  // Entries belong to the CURRENT session: a replacement session starts empty and the
+  // old file stays on disk, exactly like Pi's /new.
+  let entries = [];
   let generation = 0, activePolls = 0, maxPolls = 0, idleWaiter = deferred(), reloadHook = async () => {}, appendHook = () => {};
+  let sessionSerial = 0, newSessionHook = async () => {}, cancelSwitch = false, newSessionMode = 'normal';
   let sessionId = 'fake-session', sessionName = options.sessionName ?? 'Offline', sessionFile = join(home, 'session.jsonl');
   // Real Pi may name a fresh session before it has ever flushed a JSONL file.
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
@@ -84,6 +88,31 @@ export async function harness(t, options = {}) {
         getSessionFile: () => { check(); sessionFileRead(); return sessionFile; } },
       ui: { input: async (...args) => options.input?.(...args), confirm: async (...args) => options.confirm?.(...args) ?? false, setWidget() {}, theme: { fg: (_color, text) => { check(); return text; } }, setStatus: (_key, text) => { check(); statuses.push(text); },
         notify: (text, level) => { check(); notices.push({ text, level }); } },
+      // Faithful /new: before_switch (cancellable) -> shutdown{new} -> rebind ->
+      // session_start{reason:'new', previousSessionFile} with a FRESH id/file whose
+      // getEntries() is empty; the previous file remains readable on disk.
+      newSession: async (opts = {}) => {
+        check();
+        const vetoed = await emit('session_before_switch', { reason: 'new' });
+        if (cancelSwitch || vetoed?.cancel === true) { lifecycle.push('cancelled'); return { cancelled: true }; }
+        await newSessionHook('before');
+        const previousSessionFile = sessionFile;
+        await emit('session_shutdown', { reason: 'new' }); lifecycle.push('shutdown'); invalidate();
+        await newSessionHook('after');
+        restoredFlags = new Map(flagValues);
+        sessionSerial++;
+        sessionId = `fake-session-${sessionSerial}`;
+        sessionFile = join(home, `session-${sessionSerial}.jsonl`);
+        entries = [];
+        // Real Pi writes the replacement file only with its first assistant message;
+        // a test that needs it on disk earlier opts in explicitly.
+        if (options.persistReplacement === true) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId, parent: opts.parentSession ?? null }) + '\n');
+        await opts.setup?.({ appendMessage: message => entries.push({ type: 'message', message }) });
+        await instantiate(newSessionMode === 'omit-extension'); lifecycle.push('instantiate');
+        await emit('session_start', { reason: 'new', previousSessionFile }); lifecycle.push('start');
+        await opts.withSession?.(ctx);
+        return { cancelled: false };
+      },
       reload: async () => {
         check();
         try {
@@ -128,7 +157,9 @@ export async function harness(t, options = {}) {
     }, registerCommand: (name, command) => commands.set(name, command),
       registerFlag: (name, options) => { if (!flagValues.has(name)) flagValues.set(name, options.default); },
       getAllTools: () => { check(); if (options.toolCatalogThrows) throw new Error('fixture catalog unavailable'); return allTools; },
-      getCommands: () => { check(); if (options.catalogThrows) throw new Error('SECRET'); return [...(options.reloadCatalog ?? [{ name: 'telegram-reload', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } }]), ...discovered]; },
+      getCommands: () => { check(); if (options.catalogThrows) throw new Error('SECRET'); return [...(options.reloadCatalog ?? [
+        { name: 'telegram-reload', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } },
+        { name: 'telegram-new', source: 'extension', sourceInfo: { path: new URL('../index.ts', import.meta.url).pathname } }]), ...discovered]; },
       getFlag: name => { check(); return flagValues.get(name); },
       setModel: async model => {
         check(); modelChanges.push(`${model.provider}/${model.id}`);
@@ -201,7 +232,12 @@ export async function harness(t, options = {}) {
     return { json: async () => ({ ok: true, result: method === 'getMe' ? { username: identityUsername } : method === 'getFile' ? { file_path: 'fake.txt' } : { message_id: network.length } }) };
   });
   const h = {
-    bus, home, sent, network, compactions, statuses, errors, notices, entries, submissions, lifecycle, emit, aborts: 0,
+    bus, home, sent, network, compactions, statuses, errors, notices, submissions, lifecycle, emit, aborts: 0,
+    get entries() { return entries; },
+    get sessionFile() { return sessionFile; }, get sessionId() { return sessionId; },
+    set newSessionHook(value) { newSessionHook = value; },
+    set cancelSwitch(value) { cancelSwitch = value; },
+    set newSessionMode(value) { newSessionMode = value; },
     modelChanges, thinkingChanges, get currentModel() { return currentModel; }, get thinking() { return thinking; },
     set configWrite(value) { configWrite = value; },
     set discovered(value) { discovered = value; }, set commandSubmission(value) { commandSubmission = value; },
@@ -226,13 +262,13 @@ export async function harness(t, options = {}) {
     set sessionId(value) { sessionId = value; }, set sessionName(value) { sessionName = value; }, set sessionFile(value) { sessionFile = value; },
     command: (name, args = '') => commands.get(name).handler(args, ctx),
     reloadTool: () => tools.get('telegram_reload').execute('call', {}, undefined, undefined, ctx),
-    async replace(reason, omitExtension = false) {
+    async replace(reason, omitExtension = false, extra = {}) {
       if (options.faithfulHost && ['new', 'resume', 'fork'].includes(reason)) {
         lifecycle.push('abort'); h.aborts++;
         if (!idle) { await h.end('', 'aborted'); await h.settle(); }
         lifecycle.push('settled');
       }
-      await emit('session_shutdown', { reason }); lifecycle.push('shutdown'); invalidate(); restoredFlags = new Map(flagValues); await instantiate(omitExtension); await emit('session_start', { reason });
+      await emit('session_shutdown', { reason }); lifecycle.push('shutdown'); invalidate(); restoredFlags = new Map(flagValues); await instantiate(omitExtension); await emit('session_start', { reason, ...extra });
     },
     // Real Pi wrapper returns void; promise rejection goes to the error listener.
     asyncAdmission(preflight = async () => {}, transform = x => x) {

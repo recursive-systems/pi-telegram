@@ -96,6 +96,14 @@ To stop polling in the current session:
 /telegram-disconnect
 ```
 
+Start a fresh Pi session and carry the connection with it (the local command the
+Telegram `/new` route schedules; see
+[remote `/new`](#remote-new-session-handoff)):
+
+```bash
+/telegram-new
+```
+
 Check status:
 
 ```bash
@@ -166,6 +174,7 @@ Send `/commands`, `/help`, or `/start` for help. Implemented remote routes:
 | `/bridge_status [detail]` | Content-free bridge diagnostics sampled directly, **without a model turn** |
 | `/version` | Lazy cached checkout version, not loaded-code attestation |
 | `/compact [instructions]` | Compact only while Pi is idle; optional instruction text preserves case |
+| `/new` | Start a fresh Pi session and carry the Telegram connection, idle only; queued/held turns refuse it |
 | `/stop` or bare `stop` | Abort and hold queued history |
 | `/telegram_reload` | Request the existing safe runtime handoff, not install/upgrade source |
 | `/commands`, `/help`, `/start` | Help and a bounded local-only Pi catalog |
@@ -215,6 +224,10 @@ An in-flight transport that ignores cancellation can block lease handoff until i
 Existing language-specific lists or custom menu buttons may take precedence; v1
 does not overwrite those settings. Server-side menu changes are not transactional
 with reload, and a stale visible command never grants execution permission.
+
+`/new` is the remote equivalent of Pi's local `/new`, plus the Telegram handoff
+described under [remote `/new`](#remote-new-session-handoff). Both aliases share
+the same reservation, receipt and refusal machinery described next.
 
 The reload alias blocks new queue dispatch before its bounded **requested** receipt,
 then submits the authorized local command and releases polling ingress immediately.
@@ -382,6 +395,74 @@ as TUI diagnostics or an omitted replacement extension. If the old bridge was
 disconnected, it stays disconnected and its queue waits for explicit connect. Connected restoration verifies a Telegram
 API round trip before reporting that polling started; this is not a promise
 that subsequent network requests will succeed.
+
+### Remote `/new` session handoff
+
+Telegram `/new` starts a fresh Pi session — the same operation as the local
+`/new` — and carries only the Telegram **connection** into the replacement
+session, so the phone keeps working without a local `/telegram-connect`. It
+discards conversation context by design and never carries conversation state.
+
+It reuses the reload path's quiesce/checkpoint machinery unchanged: the remote
+alias reserves the handoff, sends a bounded **receipt** (a receipt, not proof),
+and submits the local `telegram-new` command, which waits for host idle and for
+the current Telegram reply/attachments, stops and awaits its poller, flushes
+album debounce, awaits downloads, re-checks idle/pending/preflight, and verifies
+the on-disk config is unchanged before writing a checkpoint. It then calls
+`ctx.newSession({ parentSession })` instead of `ctx.reload()`.
+
+Differences from reload, all deliberate:
+
+- **Queued work refuses it.** Prepared-but-unsent turns and `stop`-held history
+  are **not** replayed into the new session and are **not** dropped: `/new` is
+  refused (before teardown when possible) with a Telegram reply, so the durable
+  admission journal never disagrees with a turn nobody runs. Finish or stop the
+  queue, or reconcile it locally, then retry.
+- **The checkpoint is written to the old session file.** The replacement session
+  starts empty, so restoration reads the last `telegram-reload-checkpoint-v1`
+  entry (`reason: "telegram-new"`) out of `session_start.previousSessionFile` on
+  disk, with bounded scanning: an oversized file, an oversized or unparsable
+  checkpoint line, or an unreadable file refuses the handoff and reports it. A
+  previous file that does not exist is the ordinary silent cold start (Pi only
+  creates a session file with its first assistant message, so a local `/new`
+  from a fresh session has none). For the same reason a freshly created session
+  must produce an assistant response before another `/new` (or
+  `/telegram_reload`) can be carried; an oversized session file is refused
+  before teardown, so the old session stays connected.
+- **Identity is checked against the old session.** The checkpoint's session
+  id/file must be the session that was replaced (`previousSessionFile`), never
+  the restoring session's own identity.
+- **The claim is recorded in the new session.** The in-memory single-use permit
+  is what prevents a second claim: it is deleted synchronously when consumed.
+  Restoration also appends `telegram-reload-claim-v1` to the replacement session
+  as retained evidence (it reaches disk only with that session's first assistant
+  message); the original checkpoint stays in the old file and is never erased.
+- **Cancellation is a normal outcome.** Another extension may veto the switch in
+  `session_before_switch`. The permit is then released, the session is unchanged,
+  polling stays stopped, and both the local notice and the Telegram reply say so.
+
+The on-disk checkpoint is evidence, never permission. Reconnection still requires
+the same short-lived, one-shot in-process capability as reload: bound to this
+process, to that exact checkpoint digest, armed only by this handoff's own
+`session_shutdown` (with `reason: "new"` for a `telegram-new` checkpoint, and
+`reason: "reload"` for a reload one), claimed synchronously — before any await
+for reload, and for `/new` immediately after the bounded read, before any
+restoration work — and revoked when the originating call returns. An expired, absent, unarmed or
+already-claimed capability, a foreign process, a mismatched reason, or a
+changed config/cursor all fail closed: disconnected, no replay, no API call.
+
+Preserved across `/new`: connection state, the `lastUpdateId` cursor, the bridge
+epoch and the config fingerprint. Bot-username verification and menu
+registration simply redo themselves in the replacement instance. Restoration
+verifies the API with the same `deleteWebhook`/`getUpdates` probe before polling
+starts, then the **replacement** instance (never the stale old context) sends
+“New session started; Telegram reconnected.” to the requesting chat; a failed
+confirmation is a local status notice, not a failed handoff.
+
+If the switch fails after teardown, the old session keeps its checkpoint, stays
+disconnected, blocks dispatch and requires an explicit local `/telegram-connect`
+(after reconciling), exactly like a failed reload. A disconnected bridge stays
+disconnected across `/new`.
 
 ### Limits and recovery
 
