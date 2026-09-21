@@ -1285,8 +1285,11 @@ export default function (pi: ExtensionAPI) {
 			if (closed || intent !== connectionIntent) return;
 			if (switched === undefined) { await reply(`Switching to ${label} failed; inspect Pi locally.`); return; }
 			if (!switched) { await reply(`Could not switch to ${label}: no credentials configured. Model unchanged.`); return; }
+			// Levels are Pi's vocabulary, not the provider's; Pi clamps to what the model supports.
 			if (selection.thinking) pi.setThinkingLevel(selection.thinking);
-			await reply(`Model: ${label} (thinking: ${pi.getThinkingLevel()})`);
+			const effective = pi.getThinkingLevel();
+			const clamped = selection.thinking && selection.thinking !== effective ? `; ${selection.thinking} is not supported by this model` : "";
+			await reply(`Model: ${label} (thinking: ${effective}${clamped})`);
 			return;
 		}
 

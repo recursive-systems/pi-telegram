@@ -55,7 +55,7 @@ export async function harness(t, options = {}) {
   let reloadMode = 'normal', sessionFileRead = () => {};
   let idle = true, compacting = false, pending = false, poll, updateId = 0, onSend = () => {}, networkGate, beforeStart = async () => {};
   // Model registry fixture: session-level state survives host reinstantiation like real Pi.
-  const models = (options.models ?? []).map(m => ({ provider: m.provider, id: m.id, name: m.id, auth: m.auth !== false }));
+  const models = (options.models ?? []).map(m => ({ provider: m.provider, id: m.id, name: m.id, auth: m.auth !== false, levels: m.levels }));
   const modelRef = ref => models.find(m => `${m.provider}/${m.id}` === ref);
   let currentModel = options.currentModel ? modelRef(options.currentModel) : undefined, thinking = options.thinking ?? 'medium';
   const modelChanges = [], thinkingChanges = [];
@@ -137,7 +137,8 @@ export async function harness(t, options = {}) {
         currentModel = model; return true;
       },
       getThinkingLevel: () => { check(); return thinking; },
-      setThinkingLevel: level => { check(); thinking = level; thinkingChanges.push(level); },
+      // Pi clamps to the active model's capabilities; fixtures without `levels` accept everything.
+      setThinkingLevel: level => { check(); thinkingChanges.push(level); const levels = currentModel?.levels; thinking = !levels || levels.includes(level) ? level : levels.at(-1); },
       registerTool: tool => { check(); registrations.push(tool.name); tools.set(tool.name, tool); },
       appendEntry: (customType, data) => {
         check(); appendHook(customType);

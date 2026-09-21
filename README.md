@@ -176,7 +176,10 @@ model to answer. Targets are limited to the session's scoped models
 (`--models` / `enabledModels`), or the registry's available models when no scope
 is configured; exact ids only, with a bare id accepted when unique. Switching
 requires an idle Pi (`stop` first), applies the optional thinking level only
-after a successful switch, and reports the result. A refused switch (no
+after a successful switch, and reports the result. Thinking levels are Pi's
+provider-neutral vocabulary (`off` … `max`); Pi clamps to what the chosen model
+supports and the reply states the effective level, naming the request when it
+was clamped. A refused switch (no
 credentials, out of scope, ambiguous, busy) changes nothing; a host failure is
 reported without provider detail. The change is Pi's ordinary session model
 change: recorded in the session, not written to settings, and independent of

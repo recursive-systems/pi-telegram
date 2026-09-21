@@ -11,8 +11,9 @@ const catalogue = [
   { provider: 'beta', id: 'keyless-3', auth: false },
   { provider: 'gamma', id: 'backup-2' },
   { provider: 'unscoped', id: 'hidden' },
+  { provider: 'gamma', id: 'shallow-4', levels: ['off', 'low', 'medium'] },
 ];
-const scoped = ['alpha/primary-1', 'beta/backup-2', 'beta/keyless-3', 'gamma/backup-2'];
+const scoped = ['alpha/primary-1', 'beta/backup-2', 'beta/keyless-3', 'gamma/backup-2', 'gamma/shallow-4'];
 const session = t => harness(t, { models: catalogue, scoped, currentModel: 'alpha/primary-1', thinking: 'high' });
 
 test('parse: empty shows, provider/id with optional case-insensitive thinking, otherwise invalid', () => {
@@ -75,6 +76,15 @@ test('/model switches while idle, applies optional thinking, and refuses while b
   assert.match(last(h), /Cannot switch models while pi is busy/);
   assert.equal(h.modelChanges.length, 2); assert.equal(h.currentModel.provider, 'alpha');
   assert.equal(h.submissions.length, 0); assert.equal((await h.diagnostic()).held, false);
+});
+
+test('/model reports a thinking level the model clamps, in Pi vocabulary', async t => {
+  const h = await session(t);
+  await h.receive('/model gamma/shallow-4 xhigh');
+  assert.deepEqual(h.thinkingChanges, ['xhigh']); assert.equal(h.thinking, 'medium');
+  assert.equal(last(h), 'Model: gamma/shallow-4 (thinking: medium; xhigh is not supported by this model)');
+  await h.receive('/model shallow-4 low');
+  assert.equal(last(h), 'Model: gamma/shallow-4 (thinking: low)');
 });
 
 test('/model rejects usage errors, out-of-scope, ambiguous and unauthenticated targets without changing state', async t => {
