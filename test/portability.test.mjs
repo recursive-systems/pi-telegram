@@ -75,7 +75,7 @@ test('dependency overrides use package exports in a differently named private la
   const root = fs.mkdtempSync(path.join(process.env.HOME, 'unrelated-layout-'));
   t.after(() => fs.rmSync(root, { recursive: true }));
   const peer = path.join(root, 'standalone-peer'); fs.mkdirSync(peer);
-  fs.writeFileSync(path.join(peer, 'package.json'), JSON.stringify({ name: '@sinclair/typebox', exports: './public.cjs' }));
+  fs.writeFileSync(path.join(peer, 'package.json'), JSON.stringify({ name: 'typebox', exports: './public.cjs' }));
   fs.writeFileSync(path.join(peer, 'public.cjs'), 'throw new Error("must not evaluate during resolution")');
   const parser = path.join(root, 'installed-host/node_modules/@earendil-works/pi-tui'); fs.mkdirSync(parser, { recursive: true });
   fs.writeFileSync(path.join(parser, 'package.json'), JSON.stringify({ name: '@earendil-works/pi-tui', exports: './api.cjs' }));
@@ -84,7 +84,7 @@ test('dependency overrides use package exports in a differently named private la
   const previous = Object.fromEntries(Object.keys(env).map(key => [key, process.env[key]]));
   Object.assign(process.env, env);
   try {
-    assert.equal(import.meta.resolve('@sinclair/typebox'), pathToFileURL(path.join(peer, 'public.cjs')).href);
+    assert.equal(import.meta.resolve('typebox'), pathToFileURL(path.join(peer, 'public.cjs')).href);
     assert.equal(import.meta.resolve('@earendil-works/pi-tui'), pathToFileURL(path.join(parser, 'api.cjs')).href);
   } finally {
     for (const [key, value] of Object.entries(previous)) {
@@ -95,26 +95,26 @@ test('dependency overrides use package exports in a differently named private la
 test('dependency delegation preserves conditions, attributes and other context; default is unchanged', () => {
   const context = { parentURL: import.meta.url, conditions: ['node', 'import', 'custom'], importAttributes: { type: 'json' }, extra: {} };
   const result = {};
-  for (const [specifier, env] of [['@sinclair/typebox', {}], ['unrelated', { PI_PACKAGE_DIR: process.env.HOME }]]) {
+  for (const [specifier, env] of [['typebox', {}], ['unrelated', { PI_PACKAGE_DIR: process.env.HOME }]]) {
     assert.equal(resolveDependency(specifier, context, (name, actual) => {
       assert.equal(name, specifier); assert.equal(actual, context); return result;
     }, env), result);
   }
-  assert.equal(resolveDependency('@sinclair/typebox', context, (name, actual) => {
-    assert.equal(name, '@sinclair/typebox');
+  assert.equal(resolveDependency('typebox', context, (name, actual) => {
+    assert.equal(name, 'typebox');
     assert.deepEqual(actual, { ...context, parentURL: pathToFileURL(path.join(process.env.HOME, 'package.json')).href });
     for (const key of ['conditions', 'importAttributes', 'extra']) assert.equal(actual[key], context[key]);
     return result;
   }, { TYPEBOX_PACKAGE_DIR: process.env.HOME }), result);
   for (const directory of ['', 'relative']) {
-    assert.throws(() => resolveDependency('@sinclair/typebox', context, () => assert.fail('must not delegate invalid root'), { TYPEBOX_PACKAGE_DIR: directory }), /absolute package directories/);
+    assert.throws(() => resolveDependency('typebox', context, () => assert.fail('must not delegate invalid root'), { TYPEBOX_PACKAGE_DIR: directory }), /absolute package directories/);
   }
 });
 for (const importOnly of [true, false]) {
   test(`bootstrap selects ESM exports (${importOnly ? 'import-only self-reference' : 'distinct import/require nested peer'})`, async t => {
     const root = fs.mkdtempSync(path.join(process.env.HOME, 'private-export-layout-'));
     const key = importOnly ? 'TYPEBOX_PACKAGE_DIR' : 'PI_PACKAGE_DIR';
-    const name = importOnly ? '@sinclair/typebox' : '@earendil-works/pi-tui';
+    const name = importOnly ? 'typebox' : '@earendil-works/pi-tui';
     const old = process.env[key];
     t.after(() => {
       if (old === undefined) delete process.env[key]; else process.env[key] = old;

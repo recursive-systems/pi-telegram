@@ -651,7 +651,7 @@ normal `finally` cleanup does not guarantee cleanup on signals.
 Ordinary project dependency resolution is the default. For an isolated worktree
 without peers, optionally supply absolute `PI_PACKAGE_DIR` (installed Pi package
 root, resolving its public parser peer) and `TYPEBOX_PACKAGE_DIR` (installed
-legacy `@sinclair/typebox` package root). Package entries are resolved through
+`typebox` package root). Package entries are resolved through
 Node's standard package resolver, not private build paths; no host SDK is imported
 for discovery, no other checkouts are scanned, and nothing is downloaded.
 

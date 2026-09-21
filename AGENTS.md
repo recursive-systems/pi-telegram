@@ -20,12 +20,11 @@ see its AGENTS.md for the one-poller-per-token handoff protocol (`/stop`).
 
 - `index.ts` + `markdown-to-telegram.ts` (zero runtime deps except
   `markdown-it`, which pi installs automatically via `dependencies`)
-- Imports still use the `@mariozechner/*` peer scope — they resolve today
-  (pi ships compat modules + this dir has its own `node_modules`). If a pi
-  upgrade breaks them, retarget to `@earendil-works/pi-ai`,
-  `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`, and
-  `typebox`; verified typecheck-clean against 0.84.4 in the sibling bridge
-  repo on 2026-09-02.
+- Imports and peer deps target `@earendil-works/pi-ai`,
+  `@earendil-works/pi-agent-core`, `@earendil-works/pi-coding-agent`,
+  `@earendil-works/pi-tui`, and `typebox` (retargeted from the abandoned
+  `@mariozechner/*` scope on 2026-09-21; the old scope pinned
+  `pi-coding-agent@0.73.1` and `extract-zip@2.0.1` with open advisories).
 
 ## Features worth porting from the sibling bridge (`../pi-telegram/src`)
 
