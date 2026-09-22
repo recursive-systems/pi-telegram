@@ -272,7 +272,7 @@ test('valid same-process legacy checkpoint remains permitted but is not newly jo
   h.entries.push({ type: 'custom', customType: 'telegram-reload-checkpoint-v1', data: saved });
   state.permits.set(saved.nonce, { digest: hash(saved), armed: true, expires: Date.now() + 120000 });
   await h.replace('reload'); await until(() => h.sent.length === 1);
-  assert.equal(snapshot(h).records.length, 0); assert.match(h.notices.map(n => n.text).join(' '), /not newly journal-protected/);
+  assert.equal(snapshot(h).records.length, 0); assert.match(h.notices.map(n => n.text).join(' '), /resumed after reload with 1 queued message\(s\) that aren't crash-protected/);
   assert.equal(state.permits.has(saved.nonce), false);
 });
 

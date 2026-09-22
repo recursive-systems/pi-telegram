@@ -2361,7 +2361,8 @@ export default function (pi: ExtensionAPI) {
 			} else {
 				if (saved.turns.some(turn => turn.incomingIds?.length) || snapshot?.records.some(record => !terminalPhase(record.phase))) throw new Error("legacy checkpoint disagrees with journal");
 				if (saved.held && inbox && !snapshot?.stopLatched) inbox.stop([]);
-				ctx.ui.notify("Legacy same-process handoff: retained turns are not newly journal-protected.", "warning");
+				// Nothing carried over means nothing at risk; only warn when queued work exists.
+				if (saved.turns.length) ctx.ui.notify(`Telegram bridge resumed after reload with ${saved.turns.length} queued message(s) that aren't crash-protected; they'll be lost if pi exits before handling them.`, "warning");
 			}
 			queuedTelegramTurns = structuredClone(saved.turns);
 			// Diagnostic clocks restart in this instance, not at original arrival.
