@@ -47,7 +47,7 @@ export async function harness(t, options = {}) {
   const compactions = [];
   const identityUsername = options.identity ?? options.config?.botUsername;
   let discovered = options.discovered ?? [], commandSubmission = options.commandSubmission, userSubmission = options.userSubmission;
-  const sent = [], network = [], statuses = [], errors = [], notices = [], submissions = [], lifecycle = [], serverUpdates = [];
+  const sent = [], network = [], statuses = [], errors = [], notices = [], submissions = [], lifecycle = [], serverUpdates = [], customMessages = [];
   // Entries belong to the CURRENT session: a replacement session starts empty and the
   // old file stays on disk, exactly like Pi's /new.
   let entries = [];
@@ -177,6 +177,7 @@ export async function harness(t, options = {}) {
         entries.push(entry);
         if (options.persisted !== false) appendFileSync(sessionFile, JSON.stringify(entry) + '\n');
       },
+      sendMessage: (message, opts) => { check(); customMessages.push({ message: structuredClone(message), opts }); },
       sendUserMessage: (content, opts) => {
         check(); submissions.push({ content, opts });
         if (!opts?.expandPromptTemplates && userSubmission === 'throw') throw new Error('fake synchronous user submission failure');
@@ -232,7 +233,7 @@ export async function harness(t, options = {}) {
     return { json: async () => ({ ok: true, result: method === 'getMe' ? { username: identityUsername } : method === 'getFile' ? { file_path: 'fake.txt' } : { message_id: network.length } }) };
   });
   const h = {
-    bus, home, sent, network, compactions, statuses, errors, notices, submissions, lifecycle, emit, aborts: 0,
+    bus, home, sent, network, compactions, statuses, errors, notices, submissions, lifecycle, customMessages, emit, aborts: 0,
     get entries() { return entries; },
     get sessionFile() { return sessionFile; }, get sessionId() { return sessionId; },
     set newSessionHook(value) { newSessionHook = value; },

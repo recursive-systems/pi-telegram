@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 const groups = {
-  original: ['queue', 'reload', 'new-session', 'commands', 'model-command', 'integration', 'job-origin', 'markdown'].map(n => `test/${n}.test.mjs`),
+  original: ['queue', 'reload', 'new-session', 'commands', 'model-command', 'integration', 'job-origin', 'markdown', 'reaction'].map(n => `test/${n}.test.mjs`),
   integration: ['test/admission-integration.test.mjs'],
   config: ['test/admission-config.test.mjs'],
   store: ['test/admission-store.test.mjs'],

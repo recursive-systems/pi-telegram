@@ -281,6 +281,17 @@ The extension streams assistant text previews back to Telegram while pi is gener
 
 It tries Telegram draft streaming first with `sendMessageDraft`. If that is not supported for your bot, it falls back to `sendMessage` plus `editMessageText`.
 
+## Reactions as feedback
+
+An emoji reaction from the paired user to one of the bot's messages is
+recorded in the connected pi session as a `telegram-reaction` custom message
+(for example "The owner reacted 👎 to your reply "…""), queued for the next
+turn without starting one. The session keeps an excerpt of its last 200 sent
+messages so the reaction can name the reply it is about. Only added
+reactions in the private chat count. Since the message is stored in the
+session file, anything that reads sessions (for example a session archive)
+sees it too.
+
 ## Notes
 
 - Only one pi session should be connected to the bot at a time
