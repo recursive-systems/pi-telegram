@@ -124,10 +124,26 @@ interface TelegramMessage {
 	sticker?: TelegramSticker;
 }
 
+interface TelegramReactionType {
+	type: string;
+	emoji?: string;
+	custom_emoji_id?: string;
+}
+
+interface TelegramMessageReaction {
+	chat: TelegramChat;
+	message_id: number;
+	user?: TelegramUser;
+	date: number;
+	old_reaction: TelegramReactionType[];
+	new_reaction: TelegramReactionType[];
+}
+
 interface TelegramUpdate {
 	update_id: number;
 	message?: TelegramMessage;
 	edited_message?: TelegramMessage;
+	message_reaction?: TelegramMessageReaction;
 }
 
 interface TelegramGetFileResult {
@@ -477,6 +493,18 @@ export default function (pi: ExtensionAPI) {
 	const liveIncoming = new Set<number>();
 	const coldIncoming = new Set<number>();
 	const messageIds = new WeakMap<TelegramMessage, number>();
+	// What this session sent, by Telegram message id, so a reaction can say
+	// which reply it was about. Bounded; lost on reload (the reaction is still
+	// recorded, without the excerpt).
+	const sentExcerpts = new Map<number, { text: string; at: number }>();
+	const SENT_EXCERPTS_MAX = 200;
+	function rememberSent(messageId: unknown, text: unknown): void {
+		if (typeof messageId !== "number" || typeof text !== "string") return;
+		const plain = text.replace(/<[^>]+>/g, "").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&").replace(/\s+/g, " ").trim();
+		sentExcerpts.delete(messageId);
+		sentExcerpts.set(messageId, { text: plain.slice(0, 300), at: Date.now() });
+		while (sentExcerpts.size > SENT_EXCERPTS_MAX) sentExcerpts.delete(sentExcerpts.keys().next().value!);
+	}
 	const terminalPhase = (phase: AdmissionPhase) => phase === "handled" || phase === "acknowledged";
 	function ensureLease(): void {
 		if (closed) throw new Error("Telegram session closed");
@@ -719,6 +747,8 @@ export default function (pi: ExtensionAPI) {
 		if (!data.ok || data.result === undefined) {
 			throw new Error("Telegram API request failed");
 		}
+		if (method === "sendMessage") rememberSent((data.result as { message_id?: unknown }).message_id, body.text);
+		else if (method === "editMessageText") rememberSent(body.message_id, body.text);
 		return data.result;
 		} catch { throw new Error("Telegram API request unavailable"); }
 		finally { apiCalls--; maybeReleaseLease(); }
@@ -1716,6 +1746,30 @@ export default function (pi: ExtensionAPI) {
 		updateStatus(ctx);
 	}
 
+	/**
+	 * The owner's emoji reaction to one of this session's replies is feedback:
+	 * stored in the session as a `telegram-reaction` message (so the model sees
+	 * it next turn and Context Archive keeps it for the Agent Coach), never a
+	 * turn of its own. Only additions by the paired user in the private chat.
+	 */
+	async function handleReaction(reaction: TelegramMessageReaction, ctx: ExtensionContext): Promise<void> {
+		if (closed || reaction.chat.type !== "private" || !reaction.user || reaction.user.is_bot) return;
+		if (config.allowedUserId === undefined || reaction.user.id !== config.allowedUserId) return;
+		const key = (r: TelegramReactionType) => r.emoji ?? (r.custom_emoji_id ? `custom:${r.custom_emoji_id}` : r.type);
+		const old = new Set(reaction.old_reaction.map(key));
+		const added = reaction.new_reaction.map(key).filter(k => !old.has(k));
+		if (!added.length) return;
+		const sent = sentExcerpts.get(reaction.message_id);
+		const about = sent ? `your reply "${sent.text}${sent.text.length >= 300 ? "…" : ""}"` : `your Telegram message ${reaction.message_id} (not among this session's recent replies)`;
+		pi.sendMessage({
+			customType: "telegram-reaction",
+			content: `[telegram reaction] The owner reacted ${added.join(" ")} to ${about}. Treat it as feedback on that reply; no answer needed unless it changes what you are doing.`,
+			display: true,
+			details: { message_id: reaction.message_id, added, at: new Date(reaction.date * 1000).toISOString(), matched: Boolean(sent) },
+		}, { triggerTurn: false, deliverAs: "nextTurn" });
+		ctx.ui.notify(`Telegram reaction ${added.join(" ")}`, "info");
+	}
+
 	async function handleUpdate(update: TelegramUpdate, ctx: ExtensionContext, intent: number, signal: AbortSignal): Promise<void> {
 		if (!Number.isSafeInteger(update.update_id) || update.update_id < 0) throw new Error("Invalid Telegram update identity");
 		if (config.lastUpdateId !== undefined && update.update_id <= config.lastUpdateId) {
@@ -1726,6 +1780,11 @@ export default function (pi: ExtensionAPI) {
 				inbox!.admit({ ...input, sessionId: prior.input.sessionId, epoch: prior.input.epoch, receivedAt: prior.input.receivedAt });
 			}
 			return; // Confirmed durable cursor permits ignoring compacted/pruned IDs.
+		}
+		if (update.message_reaction) {
+			await handleReaction(update.message_reaction, ctx);
+			await commitConfig({ ...config, lastUpdateId: update.update_id });
+			return;
 		}
 		const message = update.message || update.edited_message;
 		const eligible = message && !message.business_connection_id && !message.guest_query_id && message.chat.type === "private" && message.from && !message.from.is_bot;
@@ -1814,7 +1873,7 @@ export default function (pi: ExtensionAPI) {
 						offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
 						limit: 10,
 						timeout: 30,
-						allowed_updates: ["message", "edited_message"],
+						allowed_updates: ["message", "edited_message", "message_reaction"],
 					},
 					{ signal },
 				);
@@ -2378,7 +2437,7 @@ export default function (pi: ExtensionAPI) {
 				// probe does not advance the cursor or acknowledge any newer server updates.
 				await callTelegram("deleteWebhook", { drop_pending_updates: false });
 				await callTelegram("getUpdates", { offset: config.lastUpdateId !== undefined ? config.lastUpdateId + 1 : undefined,
-					limit: 1, timeout: 0, allowed_updates: ["message", "edited_message"] });
+					limit: 1, timeout: 0, allowed_updates: ["message", "edited_message", "message_reaction"] });
 			}
 			if (closed) return;
 			recoveryRequired = false;
