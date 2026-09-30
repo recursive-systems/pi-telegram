@@ -840,6 +840,23 @@ latches controller refusal of later connect/setup/API/config/store/ACK activity.
 Acquisition cleanup uncertainty is reported with sanitized fixed error codes.
 New/switch/fork runtimes receive no automatic connection authority.
 
+The lease belongs only to a session that is connected, connecting, or handing its
+connection over in `/telegram-reload` or `/telegram-new`. A session that never
+connected holds none: its reloads restore without the lease when nothing is queued
+or held, and local `/telegram-inbox` inspection gives it back afterwards. Explicit
+`/telegram-disconnect`, a handoff that stopped polling and then failed, and a
+connect or setup that did not end up polling give it back once related work is
+quiescent. So several sessions of one profile can load the extension, and only the
+one that connected holds Telegram.
+
+Contention is certain, not damage: when another session holds the lease, connect
+refuses without latching repair and names the holder from an advisory
+`<profile-hash>.holder` note beside the lock (pid, session id, cwd, since; written
+by the holder, removed on its release, never used to decide ownership). A connected
+handoff that finds Telegram connected elsewhere, with nothing queued or held,
+restores disconnected instead of requiring recovery. `/telegram-status` shows the
+last refusing holder; diagnostics expose only `admission.heldElsewhere`.
+
 The store bounds each scope to 256 retained records and a 4 MiB canonical
 snapshot (including reserved transition headroom); text/caption are each 64 KiB,
 media references at most 16, file IDs at most 1024 bytes. Unresolved records are

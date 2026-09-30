@@ -18,18 +18,22 @@ export async function until(check) {
 export const assistant = (text = 'answer', stopReason = 'stop') => ({ role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage: 'model failed' });
 
 export async function harness(t, options = {}) {
-  t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
-  const home = await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
+  // `shareWith`: a second Pi session of the same user profile (same HOME, same
+  // lock and config), with its own session id/file. It reuses the first session's
+  // fake network and timers and must not need the network itself.
+  const shared = options.shareWith;
+  if (!shared) t.mock.timers.enable({ apis: ['setTimeout', 'setInterval'] });
+  const home = shared ? shared.home : await mkdtemp(join(tmpdir(), 'pi-telegram-test-'));
   const initialTools = options.toolCatalogFactory?.(home) ?? options.toolCatalog ?? [];
   let allTools = initialTools;
-  leaseBoundary.roots.add(join(home, '.pi/agent/telegram-inbox'));
+  if (!shared) leaseBoundary.roots.add(join(home, '.pi/agent/telegram-inbox'));
   const oldHome = process.env.HOME, oldTmp = process.env.TMPDIR;
   process.env.HOME = home; process.env.TMPDIR = home;
   await mkdir(join(home, '.pi/agent'), { recursive: true });
-  await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0, ...options.config }));
+  if (!shared) await writeFile(join(home, '.pi/agent/telegram.json'), JSON.stringify({ botToken: 'FAKE-OFFLINE', allowedUserId: 7, lastUpdateId: 0, ...options.config }));
   let configWrite = async () => {}, pollSignal;
   const originalOpen = fsPromises.open;
-  const writeMock = t.mock.method(fsPromises, 'open', async (path, ...args) => {
+  const writeMock = shared ? undefined : t.mock.method(fsPromises, 'open', async (path, ...args) => {
     const handle = await originalOpen(path, ...args);
     // Exact private config temporary identity, exclusive creation only.
     if (typeof path === 'string' && dirname(path) === join(home, '.pi/agent') && /^\.telegram-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/.test(basename(path))) {
@@ -40,7 +44,7 @@ export async function harness(t, options = {}) {
     return handle;
   });
   syncBuiltinESMExports();
-  t.after(() => { writeMock.mock.restore(); syncBuiltinESMExports(); });
+  if (writeMock) t.after(() => { writeMock.mock.restore(); syncBuiltinESMExports(); });
   let handlers, commands, tools, ctx, invalidate, flagValues, registrations, factoryTools, factoryFlag;
   let restoredFlags;
   const bus = new EventEmitter();
@@ -53,7 +57,7 @@ export async function harness(t, options = {}) {
   let entries = [];
   let generation = 0, activePolls = 0, maxPolls = 0, idleWaiter = deferred(), reloadHook = async () => {}, appendHook = () => {};
   let sessionSerial = 0, newSessionHook = async () => {}, cancelSwitch = false, newSessionMode = 'normal';
-  let sessionId = 'fake-session', sessionName = options.sessionName ?? 'Offline', sessionFile = join(home, 'session.jsonl');
+  let sessionId = options.sessionId ?? 'fake-session', sessionName = options.sessionName ?? 'Offline', sessionFile = join(home, options.sessionFileName ?? 'session.jsonl');
   // Real Pi may name a fresh session before it has ever flushed a JSONL file.
   if (options.persisted !== false) await writeFile(sessionFile, JSON.stringify({ type: 'session', id: sessionId }) + '\n');
   let reloadMode = 'normal', sessionFileRead = () => {};
@@ -204,7 +208,7 @@ export async function harness(t, options = {}) {
     if (restoredFlags) for (const [name, value] of restoredFlags) flagValues.set(name, value);
     else flagValues.set('telegram-diagnostics', options.diagnosticsEnabled ?? true);
   }
-  t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
+  if (!shared) t.mock.method(globalThis, 'fetch', async (url, options = {}) => {
     assert.ok(/^https:\/\/api.telegram.org\/(file\/)?botFAKE-OFFLINE\//.test(String(url)), 'only fake bot URLs allowed');
     if (String(url).includes('/file/')) {
       network.push({ method: 'download', body: {} });
@@ -329,7 +333,8 @@ export async function harness(t, options = {}) {
     attach: paths => tools.get('telegram_attach').execute('call', { paths }),
     async shutdown() { await emit('session_shutdown'); },
   };
-  t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; process.env.TMPDIR = oldTmp; leaseBoundary.roots.delete(join(home, '.pi/agent/telegram-inbox')); await rm(home, { recursive: true, force: true }); });
+  if (shared) t.after(async () => { await h.shutdown(); });
+  else t.after(async () => { await h.shutdown(); process.env.HOME = oldHome; process.env.TMPDIR = oldTmp; leaseBoundary.roots.delete(join(home, '.pi/agent/telegram-inbox')); await rm(home, { recursive: true, force: true }); });
   await instantiate(options.omitCore === true);
   await emit('session_start', { reason: options.sessionReason ?? 'startup' });
   if (options.connected !== false) {

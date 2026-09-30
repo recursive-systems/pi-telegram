@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import assert from 'node:assert/strict';
 const groups = {
   original: ['queue', 'reload', 'new-session', 'commands', 'model-command', 'integration', 'job-origin', 'markdown', 'reaction'].map(n => `test/${n}.test.mjs`),
-  integration: ['test/admission-integration.test.mjs'],
+  integration: ['test/admission-integration.test.mjs', 'test/lease-ownership.test.mjs'],
   config: ['test/admission-config.test.mjs'],
   store: ['test/admission-store.test.mjs'],
   lease: ['test/admission-lease.test.mjs'],

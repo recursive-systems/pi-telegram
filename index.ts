@@ -1,6 +1,6 @@
-import { createReadStream, existsSync, mkdirSync, realpathSync, readdirSync } from "node:fs";
+import { closeSync, constants as fsConstants, createReadStream, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, readdirSync, unlinkSync, writeSync } from "node:fs";
 import { AdmissionStore, type AdmissionInput, type AdmissionPhase, type TelegramMediaReference } from "./admission-store.ts";
-import { AdmissionLease } from "./admission-lease.ts";
+import { AdmissionLease, AdmissionLeaseError } from "./admission-lease.ts";
 import { ContinuationStore, inspectContinuationRecords } from "./continuation-store.ts";
 import { persistTelegramConfig } from "./admission-config.ts";
 import { createHash, createHmac, randomUUID } from "node:crypto";
@@ -239,6 +239,54 @@ const configDigest = (config: TelegramConfig) => createHmac("sha256", reloadStat
 	.update(JSON.stringify([config.botToken, config.botId, config.botUsername, config.allowedUserId])).digest("hex");
 
 const PROFILE_HOME = homedir();
+const PROFILE_LEASE_SCOPE = digest(["pi-telegram/profile-writer/v1"]);
+// Advisory note beside the lock naming the process that holds it, so a refused
+// connect can say where Telegram is connected. Never an ownership decision.
+const LEASE_HOLDER_FILE = `${PROFILE_LEASE_SCOPE}.holder`;
+interface LeaseHolder { pid: number; instance: string; sessionId?: string; cwd?: string; since: string }
+// Another session (this process or another) holds the profile lease. Certain,
+// unlike an I/O failure: this instance holds nothing, so it never latches repair.
+class LeaseHeldElsewhere extends Error {
+	readonly holder: LeaseHolder | undefined;
+	constructor(holder: LeaseHolder | undefined) {
+		super(describeLeaseHolder(holder));
+		this.name = "LeaseHeldElsewhere";
+		this.holder = holder;
+	}
+}
+function printable(value: string, max: number): string {
+	return value.replace(/[\x00-\x1f\x7f-\x9f]/g, "?").slice(0, max);
+}
+function describeLeaseHolder(holder: LeaseHolder | undefined): string {
+	if (!holder) return "Telegram is connected in another Pi session (not identified; it may run an older pi-telegram). Run /telegram-disconnect there, then retry /telegram-connect here.";
+	const parts = [`pid ${holder.pid}`, ...(holder.sessionId ? [`session ${holder.sessionId}`] : []), ...(holder.cwd ? [`cwd ${holder.cwd}`] : []), `since ${holder.since}`];
+	return `Telegram is connected in another Pi session (${parts.join(", ")}). Run /telegram-disconnect there, then retry /telegram-connect here.`;
+}
+function readLeaseHolder(root: string): LeaseHolder | undefined {
+	try {
+		const file = join(root, LEASE_HOLDER_FILE);
+		const info = lstatSync(file);
+		if (!info.isFile() || info.size > 4096 || info.uid !== process.getuid?.()) return undefined;
+		const value = JSON.parse(readFileSync(file, "utf8")) as Partial<LeaseHolder>;
+		if (!Number.isSafeInteger(value.pid) || (value.pid as number) <= 0 || typeof value.instance !== "string" || typeof value.since !== "string") return undefined;
+		return { pid: value.pid as number, instance: printable(value.instance, 64), since: printable(value.since, 40),
+			...(typeof value.sessionId === "string" ? { sessionId: printable(value.sessionId, 200) } : {}),
+			...(typeof value.cwd === "string" ? { cwd: printable(value.cwd, 512) } : {}) };
+	} catch { return undefined; }
+}
+function writeLeaseHolder(root: string, holder: LeaseHolder): void {
+	let fd: number | undefined;
+	try {
+		fd = openSync(join(root, LEASE_HOLDER_FILE), fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_TRUNC | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK, 0o600);
+		if (!fstatSync(fd).isFile()) return;
+		writeSync(fd, JSON.stringify(holder));
+	} catch { /* Advisory only; the lock itself is the ownership. */ }
+	finally { if (fd !== undefined) try { closeSync(fd); } catch { /* advisory */ } }
+}
+function clearLeaseHolder(root: string, instance: string): void {
+	try { if (readLeaseHolder(root)?.instance === instance) unlinkSync(join(root, LEASE_HOLDER_FILE)); }
+	catch { /* advisory */ }
+}
 const CONFIG_PATH = join(PROFILE_HOME, ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(PROFILE_HOME, ".pi", "agent", "tmp", "telegram");
 const TELEGRAM_PREFIX = "[telegram]";
@@ -506,6 +554,14 @@ export default function (pi: ExtensionAPI) {
 		while (sentExcerpts.size > SENT_EXCERPTS_MAX) sentExcerpts.delete(sentExcerpts.keys().next().value!);
 	}
 	const terminalPhase = (phase: AdmissionPhase) => phase === "handled" || phase === "acknowledged";
+	// The profile lease belongs to a session that is connected (or connecting, or
+	// handing its connection over). A session that never connected, or disconnected,
+	// must not keep it: another session could not connect Telegram at all.
+	let bridgeWanted = false;
+	// Last holder seen when this instance could not get the lease (status only).
+	let leaseHeldBy: string | undefined;
+	let holderSessionId: string | undefined;
+	let holderCwd: string | undefined;
 	function ensureLease(): void {
 		if (closed) throw new Error("Telegram session closed");
 		if (leaseUncertain || profileLease?.retired) throw new Error("Telegram lease ownership uncertain; operator repair required");
@@ -514,9 +570,20 @@ export default function (pi: ExtensionAPI) {
 		const root = join(realpathSync(PROFILE_HOME), ".pi", "agent", "telegram-inbox");
 		try { mkdirSync(root, { mode: 0o700 }); }
 		catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw new Error("Telegram inbox unavailable"); }
-		try { profileLease = AdmissionLease.acquire(root, digest(["pi-telegram/profile-writer/v1"])); }
-		catch (error) { leaseUncertain = true; throw error; }
+		try { profileLease = AdmissionLease.acquire(root, PROFILE_LEASE_SCOPE); }
+		catch (error) {
+			// Held by another session (another process, or another instance here): this
+			// instance certainly owns nothing, so refuse without latching repair.
+			if (error instanceof AdmissionLeaseError && (error.code === "contended" || error.code === "already-owned")) {
+				const refusal = new LeaseHeldElsewhere(readLeaseHolder(root));
+				leaseHeldBy = refusal.message;
+				throw refusal;
+			}
+			leaseUncertain = true; throw error;
+		}
 		inboxRoot = root;
+		leaseHeldBy = undefined;
+		writeLeaseHolder(root, { pid: process.pid, instance, ...(holderSessionId ? { sessionId: holderSessionId } : {}), ...(holderCwd ? { cwd: holderCwd } : {}), since: new Date().toISOString() });
 	}
 	function scopeFor(principal: number): string {
 		return digest(["pi-telegram/admission-records/v1", config.botToken, principal]);
@@ -572,9 +639,12 @@ export default function (pi: ExtensionAPI) {
 		// no longer dispatch; wait for every transport/preparation/finalizer first.
 		if (!profileLease || pollingPromise || setupInProgress || apiCalls || preparationCount || finalizingReply) return;
 		if (!closed && (liveIncoming.size || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || uncertainReply || failedIngress.length || failedPreparations.length)) return;
-		if (!closed && !restoredDisconnected) return;
+		// Keep it while this session wants Telegram or is handing it over; otherwise
+		// (never connected, disconnected, failed handoff) nothing here needs it.
+		if (!closed && (bridgeWanted || reloadPending)) return;
 		inbox?.close(); inbox = undefined; continuations = undefined;
 		const lease = profileLease; profileLease = undefined;
+		if (inboxRoot) clearLeaseHolder(inboxRoot, instance);
 		try { lease.release(); } catch { leaseUncertain = true; inboxFault = true; }
 	}
 	function journalTurn(turn: PendingTelegramTurn, phase: AdmissionPhase): void {
@@ -660,7 +730,7 @@ export default function (pi: ExtensionAPI) {
 			state.submitted ? "submitted" : state.active ? "active-awaiting-settlement" :
 			state.finalizing ? "finalizing" : !hostIdle ? "host-busy" : hostPending ? "host-pending" :
 			queuedTelegramTurns.length ? "awaiting-drain" : state.preparing ? "preparing" : "none";
-		return { admission: { open: !!inbox, fault: inboxFault, live: liveIncoming.size, interrupted: coldIncoming.size, continuationHeld: coldContinuations, lease: !!profileLease && !profileLease.retired, leaseUncertain }, instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
+		return { admission: { open: !!inbox, fault: inboxFault, live: liveIncoming.size, interrupted: coldIncoming.size, continuationHeld: coldContinuations, lease: !!profileLease && !profileLease.retired, leaseUncertain, heldElsewhere: !!leaseHeldBy }, instance, loadedAt, closed, menuState, configured: !!config.botToken, paired: config.allowedUserId !== undefined, polling: !!pollingPromise,
 			queued: queuedTelegramTurns.length, ...state, preparationCount,
 			reloadPending, recoveryRequired, restoredDisconnected, uncertainReply: !!uncertainReply,
 			failedPreparations: failedPreparations.length, failedIngress: failedIngress.length,
@@ -1134,9 +1204,12 @@ export default function (pi: ExtensionAPI) {
 		if (closed || inboxFault || recoveryRequired || !ctx.hasUI || setupInProgress || reloadPending) return;
 		ensureLease();
 		if (liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || failedIngress.length || failedPreparations.length) {
-			ctx.ui.notify("Telegram setup refused: live ownership must quiesce first.", "error"); return;
+			ctx.ui.notify("Telegram setup refused: live ownership must quiesce first.", "error");
+			if (!pollingPromise) settleDisconnected();
+			return;
 		}
 		setupInProgress = true;
+		bridgeWanted = true;
 		try {
 			const token = await ctx.ui.input("Telegram bot token", "123456:ABCDEF...");
 			if (!token || closed) return;
@@ -1166,6 +1239,8 @@ export default function (pi: ExtensionAPI) {
 			updateStatus(ctx);
 		} finally {
 			setupInProgress = false;
+			// Setup that did not end up polling leaves this session disconnected.
+			if (!closed && !pollingPromise && !inboxFault) bridgeWanted = false;
 			maybeReleaseLease();
 			drainTelegramQueue(ctx);
 		}
@@ -1909,15 +1984,20 @@ export default function (pi: ExtensionAPI) {
 		if (closed || inboxFault || reloadPending || !config.botToken || pollingPromise) return;
 		try {
 			ensureLease();
-			if ((config.lastUpdateId === undefined || config.allowedUserId === undefined) && readdirSync(inboxRoot!).some(name => name !== `${digest(["pi-telegram/profile-writer/v1"])}.lock`))
+			if ((config.lastUpdateId === undefined || config.allowedUserId === undefined) && readdirSync(inboxRoot!).some(name => name !== `${PROFILE_LEASE_SCOPE}.lock` && name !== LEASE_HOLDER_FILE))
 				throw new Error("Telegram cursor or pairing missing over existing inbox");
 			openInbox();
-		} catch { inboxFault = true; updateStatus(ctx, "inbox unavailable; operator repair required"); return; }
+		} catch (error) {
+			// Connected elsewhere is not damage here: stay disconnected, say where.
+			if (error instanceof LeaseHeldElsewhere) { bridgeWanted = false; updateStatus(ctx, error.message); return; }
+			inboxFault = true; updateStatus(ctx, "inbox unavailable; operator repair required"); return;
+		}
 		// A failed, quiesced handoff may retain identity for its drained ingress.
 		// Starting another connection always requires a fresh verification.
 		verifiedUsername = undefined;
 		verifiedToken = undefined;
 		restoredDisconnected = false;
+		bridgeWanted = true;
 		menuAttempted = false;
 		menuState = "not-attempted";
 		pollingController = new AbortController();
@@ -1955,6 +2035,14 @@ export default function (pi: ExtensionAPI) {
 	// Abandoning before quiescing must replace wakes consumed under reloadPending.
 	// Use the normal deferred finalization/admission gates; never reconnect or
 	// release existing stop/disconnected/recovery holds here.
+	// A handoff that stopped polling and then failed leaves this session disconnected:
+	// give the lease back (unless work still needs it) so /telegram-connect anywhere works.
+	function settleDisconnected(): void {
+		if (closed || pollingPromise) return;
+		bridgeWanted = false;
+		maybeReleaseLease();
+	}
+
 	function releaseUnstartedReload(ctx: ExtensionContext): void {
 		reloadPending = false;
 		reloadRunning = false;
@@ -2070,6 +2158,7 @@ export default function (pi: ExtensionAPI) {
 			await reportRefusal(stopped
 				? "New session refused before teardown; this session is unchanged and its Telegram polling is now stopped. Reconnect locally with /telegram-connect."
 				: "New session refused before teardown; this session and its Telegram work are unchanged. Wait for a safe idle moment and retry.");
+			if (stopped) settleDisconnected();
 			return;
 		}
 		// Terminal: failures after runtime invalidation are reported by the host, not
@@ -2093,6 +2182,7 @@ export default function (pi: ExtensionAPI) {
 					? "Telegram /new failed before session replacement; polling stopped and the checkpoint is retained. Explicit /telegram-connect required."
 					: "Telegram runtime reload failed before shutdown; queue retained and polling stopped. Explicit retry required.", "error");
 				await reportRefusal("New session failed before replacement; this session is unchanged and its Telegram polling is stopped. Reconnect with /telegram-connect.");
+				settleDisconnected();
 				return;
 			}
 			// The host error channel owns reporting after teardown; no stale API calls.
@@ -2113,6 +2203,7 @@ export default function (pi: ExtensionAPI) {
 						: "Telegram runtime was not replaced; queue retained and polling stopped. Explicit retry required.", "error");
 				// Cancellation already reported itself above; a silent non-replacement has not.
 				if (!cancelled) await reportRefusal("New session failed before replacement; this session is unchanged and its Telegram polling is stopped. Reconnect with /telegram-connect.");
+				settleDisconnected();
 			}
 		}
 		return;
@@ -2269,6 +2360,8 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Interrupted input acknowledged locally. No old input replayed.", "info");
 				drainTelegramQueue(ctx);
 			} catch { if (!closed) ctx.ui.notify("Telegram inbox refused: unavailable, live ownership, invalid selection or operator repair required. No replay or reset performed.", "error"); }
+			// Local inspection is not a connection: a disconnected session gives the lease back.
+			finally { if (!closed) maybeReleaseLease(); }
 		},
 	});
 
@@ -2295,6 +2388,8 @@ export default function (pi: ExtensionAPI) {
 			status.push(`reload: ${recoveryRequired ? "recovery required" : reloadPending ? "pending" : "none"}`,
 				`failed preparations/ingress: ${failedPreparations.length}/${failedIngress.length}`,
 				`uncertain reply: ${uncertainReply ? "yes" : "no"}`);
+			// Local notice only: which session holds Telegram when this one could not get it.
+			if (leaseHeldBy && !profileLease) status.push(`lease holder (last refusal): ${leaseHeldBy}`);
 			ctx.ui.notify(`checkout version (lazy cached, not loaded code): ${checkoutVersion} | ${status.join(" | ")}`, "info");
 		},
 	});
@@ -2307,18 +2402,29 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify("Telegram handoff pending or recovery required; inspect the retained session checkpoint before any reconnect.", "error");
 				return;
 			}
-			ensureLease();
-			const next = await loadConfig();
-			if ((configDigest(next) !== configDigest(config) || next.lastUpdateId !== config.lastUpdateId) && (liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || pollingPromise)) {
-				ctx.ui.notify("Telegram identity change refused: live ownership.", "error"); return;
+			try { ensureLease(); }
+			catch (error) {
+				if (!(error instanceof LeaseHeldElsewhere)) throw error;
+				ctx.ui.notify(error.message, "error"); updateStatus(ctx, error.message); return;
 			}
-			config = next;
-			if (!config.botToken) {
-				await promptForConfig(ctx);
-				return;
+			bridgeWanted = true;
+			try {
+				const next = await loadConfig();
+				if ((configDigest(next) !== configDigest(config) || next.lastUpdateId !== config.lastUpdateId) && (liveIncoming.size || coldContinuations || preparationCount || queuedTelegramTurns.length || submittedTelegramTurn || activeTelegramTurn || finalizingReply || uncertainReply || pollingPromise)) {
+					ctx.ui.notify("Telegram identity change refused: live ownership.", "error"); return;
+				}
+				config = next;
+				if (!config.botToken) {
+					await promptForConfig(ctx);
+					return;
+				}
+				await startPolling(ctx);
+				updateStatus(ctx);
+			} finally {
+				// Connect that did not end up polling leaves nothing connected here. A
+				// damaged inbox keeps its lease for local repair, as before.
+				if (!closed && !pollingPromise && !setupInProgress && !inboxFault) settleDisconnected();
 			}
-			await startPolling(ctx);
-			updateStatus(ctx);
 		},
 	});
 
@@ -2327,6 +2433,7 @@ export default function (pi: ExtensionAPI) {
 		handler: async (_args, ctx) => {
 			connectionIntent++;
 			restoredDisconnected = true;
+			bridgeWanted = false;
 			if (reservation) { reservation = undefined; pendingHandoffRequest = undefined; releaseUnstartedReload(ctx); }
 			await stopPolling();
 			maybeReleaseLease();
@@ -2336,6 +2443,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		subscribeOrigins(ctx);
+		try { holderSessionId = ctx.sessionManager.getSessionId(); holderCwd = ctx.cwd; } catch { /* advisory */ }
 		// CLI/restored flags are applied after the factory, before session_start.
 		registerDiagnosticsTool();
 		transition("session-start");
@@ -2406,9 +2514,17 @@ export default function (pi: ExtensionAPI) {
 			if (saved.configDigest !== configDigest(config) || saved.cursor !== config.lastUpdateId) throw new Error("config mismatch");
 			if (saved.bridgeEpoch !== undefined && !validEpoch(saved.bridgeEpoch)) throw new Error("invalid bridge epoch");
 			if (saved.bridgeEpoch !== undefined) bridgeEpoch = saved.bridgeEpoch;
-			ensureLease(); openInbox();
+			// A disconnected session with nothing queued or held carries nothing that the
+			// journal must vouch for: restore it like a cold start, without the lease, so
+			// an idle session's reload never takes Telegram from the session using it.
+			const carriesWork = saved.connected || !Array.isArray(saved.turns) || saved.turns.length > 0 || saved.held;
+			bridgeWanted = saved.connected;
+			if (carriesWork) { ensureLease(); openInbox(); }
+			else inspectColdContinuations();
 			const snapshot = inbox?.inspect();
-			if (saved.admission) {
+			if (saved.admission && !carriesWork) {
+				// Nothing restored, so nothing to reconcile against the journal.
+			} else if (saved.admission) {
 				if (!snapshot || saved.admission.scope !== snapshot.scope || saved.admission.generation !== snapshot.generation || saved.admission.stopLatched !== snapshot.stopLatched || saved.held !== snapshot.stopLatched) throw new Error("journal disagreement");
 				const ids = saved.turns.flatMap(turn => turn.incomingIds ?? []);
 				if (new Set(ids).size !== ids.length) throw new Error("duplicate checkpoint ownership");
@@ -2443,6 +2559,8 @@ export default function (pi: ExtensionAPI) {
 			recoveryRequired = false;
 			reloadPending = false;
 			if (saved.connected) await startPolling(ctx);
+			// Restored disconnected: keep the lease only while restored work needs it.
+			else maybeReleaseLease();
 			if (closed) return;
 			ctx.ui.notify(kind === "new"
 				? (saved.connected ? "New Pi session started; Telegram handoff restored, API verified, polling started (future network failures remain possible)."
@@ -2459,8 +2577,16 @@ export default function (pi: ExtensionAPI) {
 				if (closed) return;
 			}
 			drainTelegramQueue(ctx);
-		} catch {
+		} catch (error) {
 			if (closed) return;
+			// Another session connected Telegram during the handoff. Nothing was restored
+			// and nothing is carried, so stay disconnected and say where it is connected.
+			if (error instanceof LeaseHeldElsewhere && !profileLease && Array.isArray(saved.turns) && !saved.turns.length && !saved.held) {
+				recoveryRequired = false; reloadPending = false; bridgeWanted = false; restoredDisconnected = true;
+				updateStatus(ctx);
+				ctx.ui.notify(`Telegram handoff not restored; this session stays disconnected. ${error.message}`, "warning");
+				return;
+			}
 			ctx.ui.notify("Telegram handoff recovery required; disconnected and dispatch blocked. Original queue checkpoint retained in private session data. Preserve it and reconcile Telegram messages manually before ordinary reload/connect; no automatic replay or retry.", "error");
 		}
 	});

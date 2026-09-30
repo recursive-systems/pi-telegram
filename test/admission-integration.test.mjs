@@ -196,7 +196,9 @@ test('profile lease precedes first-unpaired polling, config setup, store open an
   const h = await harness(t, { connected: false, config: { allowedUserId: undefined }, input: async () => 'FAKE-OFFLINE' });
   fs.mkdirSync(root(h), { mode: 0o700 }); const lease = AdmissionLease.acquire(root(h), profile);
   try {
-    await assert.rejects(h.command('telegram-connect'), /already-owned/);
+    // Held elsewhere is a clear refusal naming the situation, never latched repair.
+    await h.command('telegram-connect'); assert.match(h.notices.at(-1).text, /connected in another Pi session \(not identified/);
+    assert.equal((await h.diagnostic()).admission.leaseUncertain, false); assert.equal((await h.diagnostic()).admission.heldElsewhere, true);
     await h.command('telegram-setup'); await h.command('telegram-inbox', 'acknowledge 1');
     assert.equal(h.network.length, 0); assert.equal(config(h).lastUpdateId, 0); assert.equal(fs.existsSync(file(h)), false);
   } finally { lease.release(); }
