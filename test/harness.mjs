@@ -11,8 +11,13 @@ import { join, dirname, basename } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
 
 export const deferred = () => { let resolve, reject; const promise = new Promise((a, b) => { resolve = a; reject = b; }); return { promise, resolve, reject }; };
+// Waits on fake lifecycles that also do real file I/O are bounded by turns AND
+// wall time: turns alone (~150 ms idle) ran out on a loaded machine.
+// A wait that never settles still fails, after the turns and PATIENCE_MS.
+export const PATIENCE_MS = 10000;
+export const patient = (i, start, turns) => i < turns || performance.now() - start < PATIENCE_MS;
 export async function until(check) {
-  for (let i = 0; i < 10000; i++) { if (check()) return; await immediate(); }
+  for (let i = 0, start = performance.now(); patient(i, start, 10000); i++) { if (check()) return; await immediate(); }
   assert.fail('fake lifecycle did not reach expected boundary');
 }
 export const assistant = (text = 'answer', stopReason = 'stop') => ({ role: 'assistant', content: [{ type: 'text', text }], stopReason, errorMessage: 'model failed' });

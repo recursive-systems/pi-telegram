@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
-import { harness, deferred, until } from './harness.mjs';
+import { harness, deferred, until, patient } from './harness.mjs';
 
 const snapshots = h => h.entries.filter(e => e.customType === 'telegram-reload-checkpoint-v1');
 const claims = h => h.entries.filter(e => e.customType === 'telegram-reload-claim-v1');
@@ -316,7 +316,7 @@ for (const result of ['not-file', 'missing', 'throw-isFile']) {
         await until(() => checking);
         if (hold === 'stop') await h.receive('stop');
         download.resolve();
-        for (let i = 0; i < 100; i++) {
+        for (let i = 0, start = performance.now(); patient(i, start, 100); i++) {
           const d = await h.diagnostic();
           if (d.queued === 2 && !d.preparing && !d.drainScheduled) break;
           await ticks();

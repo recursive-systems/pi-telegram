@@ -6,7 +6,7 @@ import { syncBuiltinESMExports } from 'node:module';
 import { createHmac, createHash } from 'node:crypto';
 import { join } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
-import { harness, deferred, until } from './harness.mjs';
+import { harness, deferred, until, patient } from './harness.mjs';
 import { telegramCommands, telegramHelp } from '../telegram-commands.ts';
 
 const CHECKPOINT = 'telegram-reload-checkpoint-v1';
@@ -106,7 +106,7 @@ test('host still busy after quiescing refuses /new and reports it to Telegram', 
   const requesting = h.receive('/new');
   await h.end(); await h.settle(); await until(() => downloading);
   h.pending = true; gate.resolve(); await requesting;
-  for (let i = 0; i < 1000 && (await h.diagnostic()).reloadPending; i++) await ticks();
+  for (let i = 0, start = performance.now(); patient(i, start, 1000) && (await h.diagnostic()).reloadPending; i++) await ticks();
   assert.equal(h.generation, 1); assert.equal(h.entries.length, 0);
   assert.equal(h.polling, false, 'quiesced refusal stays disconnected until explicit connect');
   assert.match(replies(h), /New session refused before teardown/);
@@ -118,7 +118,7 @@ test('a cancelled session_before_switch releases the permit and never reconnects
   await h.start('local'); await h.end(); await h.settle();
   h.cancelSwitch = true;
   await h.receive('/new');
-  for (let i = 0; i < 1000 && (await h.diagnostic()).reloadPending; i++) await ticks();
+  for (let i = 0, start = performance.now(); patient(i, start, 1000) && (await h.diagnostic()).reloadPending; i++) await ticks();
   assert.equal(h.generation, 1); assert.equal(h.polling, false);
   assert.equal(processState().permits.size, 0, 'cancellation revokes the capability');
   assert.equal((await savedCheckpoints(h.sessionFile)).length, 1, 'checkpoint is retained as evidence');

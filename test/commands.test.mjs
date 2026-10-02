@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { readFile, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { setImmediate as immediate } from 'node:timers/promises';
-import { harness, deferred, until } from './harness.mjs';
+import { harness, deferred, until, patient } from './harness.mjs';
 import { telegramCommands, parseTelegramCommand, telegramHelp } from '../telegram-commands.ts';
 const replies = h => h.network.filter(n => n.method === 'sendMessage').map(n => n.body.text).join('\n');
 const text = c => c.filter(p => p.type === 'text').map(p => p.text).join('\n');
@@ -334,7 +334,7 @@ test('accepted text and queued file prepare while disconnected; awaited reconnec
   h.push('text second'); await until(() => entered);
   const disconnecting = h.command('telegram-disconnect'); cursor.resolve(); await disconnecting;
   download.resolve();
-  for (let i = 0; i < 10000 && (await h.diagnostic()).preparationCount; i++) await tick();
+  for (let i = 0, start = performance.now(); patient(i, start, 10000) && (await h.diagnostic()).preparationCount; i++) await tick();
   assert.equal((await h.diagnostic()).preparationCount, 0);
   await h.end('current reply'); await h.settle(); await h.settle(); await tick();
   assert.match(replies(h), /current reply/); assert.equal(h.sent.length, 1);
@@ -364,7 +364,7 @@ test('album accepted at cursor suspension remains prepared under disconnect hold
   h.push(undefined, { caption: '/stop', media_group_id: 'a', document: { file_id: 'album', file_name: 'album.txt' } });
   await until(() => entered); const disconnecting = h.command('telegram-disconnect'); gate.resolve(); await disconnecting;
   t.mock.timers.tick(1200);
-  for (let i = 0; i < 10000 && (await h.diagnostic()).preparationCount; i++) await tick();
+  for (let i = 0, start = performance.now(); patient(i, start, 10000) && (await h.diagnostic()).preparationCount; i++) await tick();
   assert.equal((await h.diagnostic()).queued, 1); assert.equal(h.sent.length, 0);
   assert.equal((await h.diagnostic()).held, false);
   await h.settle(); assert.equal(h.sent.length, 0);
